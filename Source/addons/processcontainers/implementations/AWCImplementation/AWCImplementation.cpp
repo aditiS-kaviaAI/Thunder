@@ -66,11 +66,11 @@ bool AWCContainer::WaitUntilAWCReady() const
     } while (true);
 
     if (!result || !is_ready) {
-      TRACE_L1("Giving up on waiting on awc to be ready. It is not. (%d,%d)");
+      TRACE_L1("Giving up on waiting on awc to be ready. It is not. (%d,%d)", result, is_ready);
     } else {
       TRACE_L1("Yes, AWC is ready!");
     }
-    return is_ready;
+    return result && is_ready;
 }
 
 bool AWCContainer::Start(const string& command, IStringIterator& parameters)
@@ -81,7 +81,9 @@ bool AWCContainer::Start(const string& command, IStringIterator& parameters)
         return false;
     }
 
-    WaitUntilAWCReady();
+    if (!WaitUntilAWCReady()) {
+        return false;
+    }
 
     awc::AWCClient::str_vect_sptr_t windowParams = std::make_shared<std::vector<std::string>>();
     awc::AWCClient::str_vect_sptr_t appParams = std::make_shared<std::vector<std::string>>();
@@ -112,17 +114,18 @@ bool AWCContainer::Start(const string& command, IStringIterator& parameters)
                                                                 windowParams, run_id);
         TRACE_L1("starting result result=%d run_id=%d", awc_result, run_id);
         result = (awc_result == awc::AWCClient::AWC_STATUS_OK);
-        while (result && _pid == 0 && _appState != awc::AWC_STATE_STARTED)
-        {
-            _runId = run_id; _waitForResponse = true;
-            TRACE_L1("waiting for start Id()=%s", Id().c_str());
-            _cv.wait_for(lock, std::chrono::seconds(30), [this] { return !_waitForResponse; });
+        if (result && (run_id >= 0)) {
+            _runId = run_id;
+            _waitForResponse = true;
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+            const bool notified = _cv.wait_until(lock, deadline, [this] {
+                return ((_appState == awc::AWC_STATE_STARTED) && (_pid > 0))
+                    || (_appState == awc::AWC_STATE_STOPPED);
+            });
+            result = notified && (_appState == awc::AWC_STATE_STARTED) && (_pid > 0);
             _waitForResponse = false;
-            if (_appState != awc::AWC_STATE_STARTED && _appState != awc::AWC_STATE_STARTING)
-            {
-                TRACE_L1("unexpected notification arrived _pid=%d _appState=%d", _pid, _appState);
-                result = false;
-            }
+        } else {
+            result = false;
         }
     }
     TRACE_L1("_pid=%d _runId=%d result=%d", _pid, _runId, result);
@@ -142,16 +145,11 @@ bool AWCContainer::Stop(const uint32_t timeout /*ms*/)
     awc::AWCClient::awc_status_t awc_result = _client->stop(_pid, 0); // documentation: exit type is important only for Netflix
     bool result = (awc_result == awc::AWCClient::AWC_STATUS_OK);
     TRACE_L1("awc_result=%d result=%d", awc_result, result);
-    while (result && _appState != awc::AWC_STATE_STOPPED)
-    {
+    if (result) {
         _waitForResponse = true;
         TRACE_L1("waiting for stop id=%s timeout=%u[ms]", Id().c_str(), timeout);
-        const auto status = _cv.wait_for(lock, std::chrono::seconds(30), [this] { return !_waitForResponse; });
-        if (_waitForResponse && !status && _appState != awc::AWC_STATE_STOPPED)
-        {
-            TRACE_L1("timeout, stop notification not arrived _pid=%d _appState=%d", _pid, _appState);
-            result = false;
-        }
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout);
+        result = _cv.wait_until(lock, deadline, [this] { return _appState == awc::AWC_STATE_STOPPED; });
         _waitForResponse = false;
     }
     TRACE_L1("result=%d", result);
@@ -173,11 +171,8 @@ void AWCContainer::notifyStateChange(int req_id, awc::awc_app_state_t app_state,
         {
             TRACE_L1("container was alredy stopped");
         }
-        if (_waitForResponse)
-        {
-            _waitForResponse = false;
-            _cv.notify_one();
-        }
+        // Notify every transition; only the waiting thread evaluates final state.
+        _cv.notify_all();
     }
 }
 

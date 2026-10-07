@@ -22,9 +22,35 @@
 
 #include <core/core.h>
 #include <cryptalgo/cryptalgo.h>
+#ifdef SECURESOCKETS_ENABLED
+#include <cryptalgo/SecureSocketPort.h>
+#include <openssl/x509v3.h>
+#endif
 
 namespace Thunder {
 namespace Tests {
+
+#ifdef SECURESOCKETS_ENABLED
+    TEST(TLS_P1, CertificateDnsAndIpIdentity)
+    {
+        X509* native = X509_new();
+        ASSERT_NE(native, nullptr);
+        X509_EXTENSION* san = X509V3_EXT_conf_nid(nullptr, nullptr, NID_subject_alt_name,
+            const_cast<char*>("DNS:expected.example,IP:127.0.0.1"));
+        ASSERT_NE(san, nullptr);
+        ASSERT_EQ(X509_add_ext(native, san, -1), 1);
+        X509_EXTENSION_free(san);
+        Crypto::Certificate certificate(native);
+        X509_free(native);
+        EXPECT_TRUE(certificate.ValidHostname("expected.example"));
+        EXPECT_FALSE(certificate.ValidHostname("wrong.example"));
+        EXPECT_TRUE(certificate.ValidHostname("127.0.0.1"));
+        EXPECT_FALSE(certificate.ValidHostname("127.0.0.2"));
+        Core::NodeId endpoint("127.0.0.1", static_cast<uint16_t>(443));
+        endpoint.HostName(); // A reverse lookup must not alter certificate identity.
+        EXPECT_EQ(endpoint.EndpointIdentity(), "127.0.0.1");
+    }
+#endif
 
     // Helper: convert digest bytes to hex string for comparison
     static string ToHex(const uint8_t* data, uint8_t length)
@@ -445,6 +471,68 @@ namespace Tests {
 
         // Same key, different IV → different ciphertext
         EXPECT_NE(memcmp(cipher1, cipher2, 16), 0);
+    }
+
+    TEST(Cryptalgo_AES, RejectPartialBlocksWithoutMutation)
+    {
+        const uint8_t key[16] = {};
+        const uint8_t input[32] = {};
+        for (auto mode : { Crypto::AES_ECB, Crypto::AES_CBC }) {
+            for (uint32_t length : { 1u, 15u, 17u, 31u }) {
+                uint8_t output[32];
+                memset(output, 0xA5, sizeof(output));
+                Crypto::AESEncryption enc(mode);
+                Crypto::AESDecryption dec(mode);
+                ASSERT_EQ(enc.Key(16, key), 0u);
+                ASSERT_EQ(dec.Key(16, key), 0u);
+                EXPECT_EQ(enc.Encrypt(length, input, output), ::Thunder::Core::ERROR_BAD_REQUEST);
+                EXPECT_EQ(dec.Decrypt(length, input, output), ::Thunder::Core::ERROR_BAD_REQUEST);
+                for (auto byte : output) {
+                    EXPECT_EQ(byte, 0xA5);
+                }
+                const uint8_t iv[16] = {};
+                EXPECT_EQ(memcmp(enc.InitialVector(), iv, 16), 0);
+                EXPECT_EQ(memcmp(dec.InitialVector(), iv, 16), 0);
+            }
+        }
+    }
+
+    TEST(Cryptalgo_AES, StreamReferenceAndSplitCalls)
+    {
+        const uint8_t key[16] = { 0x2b,0x7e,0x15,0x16,0x28,0xae,0xd2,0xa6,0xab,0xf7,0x15,0x88,0x09,0xcf,0x4f,0x3c };
+        const uint8_t iv[16] = { 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 };
+        const uint8_t input[17] = { 0x6b,0xc1,0xbe,0xe2,0x2e,0x40,0x9f,0x96,0xe9,0x3d,0x7e,0x11,0x73,0x93,0x17,0x2a,0xae };
+        // NIST SP 800-38A CFB128 and OFB first-block known answers.
+        const uint8_t expected[17] = { 0x3b,0x3f,0xd9,0x2e,0xb7,0x2d,0xad,0x20,0x33,0x34,0x49,0xf8,0xe8,0x3c,0xfb,0x4a,0xc8 };
+        for (auto mode : { Crypto::AES_CFB8, Crypto::AES_CFB128, Crypto::AES_OFB }) {
+            uint8_t whole[17] = {};
+            Crypto::AESEncryption one(mode);
+            ASSERT_EQ(one.Key(16, key), 0u);
+            one.InitialVector(iv);
+            ASSERT_EQ(one.Encrypt(17, input, whole), 0u);
+            if (mode == Crypto::AES_CFB128) {
+                EXPECT_EQ(memcmp(whole, expected, 17), 0);
+            } else if (mode == Crypto::AES_OFB) {
+                EXPECT_EQ(memcmp(whole, expected, 16), 0);
+                EXPECT_EQ(whole[16], 0x77);
+            }
+            for (uint32_t split : { 1u, 5u, 15u }) {
+                uint8_t parts[17] = {};
+                uint8_t plain[17] = {};
+                Crypto::AESEncryption enc(mode);
+                Crypto::AESDecryption dec(mode);
+                ASSERT_EQ(enc.Key(16, key), 0u);
+                ASSERT_EQ(dec.Key(16, key), 0u);
+                enc.InitialVector(iv);
+                dec.InitialVector(iv);
+                ASSERT_EQ(enc.Encrypt(split, input, parts), 0u);
+                ASSERT_EQ(enc.Encrypt(17 - split, input + split, parts + split), 0u);
+                EXPECT_EQ(memcmp(whole, parts, 17), 0);
+                ASSERT_EQ(dec.Decrypt(split, whole, plain), 0u);
+                ASSERT_EQ(dec.Decrypt(17 - split, whole + split, plain + split), 0u);
+                EXPECT_EQ(memcmp(input, plain, 17), 0);
+            }
+        }
     }
 
     TEST(Cryptalgo_AES, TypeAccessor)

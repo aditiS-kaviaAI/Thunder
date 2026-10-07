@@ -18,6 +18,7 @@
  */
 
 #include "JSONWebToken.h"
+#include <vector>
 
 namespace Thunder {
 
@@ -85,14 +86,23 @@ namespace Web
     }
     uint16_t JSONWebToken::Encode(string & token, const uint16_t length, const uint8_t payload[]) const
     {
-        uint16_t destinationLength = (((length * 8) / 6) + 4) * sizeof(TCHAR);
-
-        TCHAR* destinationBuffer = reinterpret_cast<TCHAR*>(ALLOCA(destinationLength * sizeof(TCHAR)));
+        const size_t encodedLength = (size_t(length) * 8 + 5) / 6;
+        const size_t totalLength = _header.size() + 2 + encodedLength + 43;
+        // Both the token return value and the HMAC input API are 16-bit.
+        if (_mode != SHA256 || totalLength >= 0xFFFF
+            || (totalLength - 44) * sizeof(TCHAR) > 0xFFFF
+            || (length != 0 && payload == nullptr)) {
+            token.clear();
+            return 0;
+        }
+        std::vector<TCHAR> destination(encodedLength + 1);
+        TCHAR* destinationBuffer = destination.data();
+        const uint16_t destinationLength = static_cast<uint16_t>(destination.size());
         uint16_t convertedLength = Core::URL::Base64Encode(
             payload,
             length,
             destinationBuffer,
-            destinationLength / sizeof(TCHAR));
+            destinationLength, false);
 
         token = (_header + '.' + string(destinationBuffer, convertedLength));
 
@@ -112,6 +122,9 @@ namespace Web
     }
     uint16_t JSONWebToken::Decode(const string& token, const uint16_t maxLength, uint8_t payload[]) const
     {
+        if (token.size() >= 0xFFFF || token.size() * sizeof(TCHAR) > 0xFFFF) {
+            return static_cast<uint16_t>(~0);
+        }
         uint16_t length = 0;
 
         // Check what method to use
@@ -123,7 +136,8 @@ namespace Web
 
             // Extract the header
             string header(token.substr(0, pos));
-            TCHAR* output = reinterpret_cast<TCHAR*>(ALLOCA(header.length() * sizeof(TCHAR)));
+            std::vector<TCHAR> storage(header.length() + 1);
+            TCHAR* output = storage.data();
 
             length = Core::URL::Base64Decode(
                 header.c_str(),
@@ -155,6 +169,9 @@ namespace Web
 
     bool JSONWebToken::ValidSignature(const mode type, const string& token) const 
     {
+        if (token.size() >= 0xFFFF || token.size() * sizeof(TCHAR) > 0xFFFF) {
+            return false;
+        }
         bool result = false;
 
         // Check if the Hash is correct..

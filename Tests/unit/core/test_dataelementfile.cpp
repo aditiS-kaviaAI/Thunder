@@ -110,6 +110,42 @@ namespace Core {
         EXPECT_TRUE(file.Destroy());
     }
 
+    TEST(test_datafile_p1, copy_and_move_lifetime)
+    {
+        // PUBLIC_INTERFACE
+        /** Test-only mapping type exposing cleanup for lifetime assertions. */
+        struct Mapping : ::Thunder::Core::DataElementFile {
+            using DataElementFile::DataElementFile;
+            using DataElementFile::Close;
+            Mapping(const Mapping&) = default;
+            Mapping(Mapping&&) = default;
+        };
+        const string path = "thunder-p1-mapping.bin";
+        ::Thunder::Core::File file(path);
+        ASSERT_TRUE(file.Create());
+        ASSERT_TRUE(file.SetSize(16));
+        file.Close();
+        {
+            Mapping original(path,
+                ::Thunder::Core::File::USER_READ | ::Thunder::Core::File::USER_WRITE, 16);
+            ASSERT_EQ(original.Size(), 16u);
+            original.Buffer()[0] = 42;
+            const auto& source = original;
+            Mapping copy(source);
+            ASSERT_EQ(copy.Size(), 16u);
+            EXPECT_NE(copy.Buffer(), original.Buffer());
+            original.Close();
+            EXPECT_EQ(copy.Buffer()[0], 42);
+            Mapping moved(std::move(copy));
+            EXPECT_EQ(copy.Size(), 0u);
+            ASSERT_EQ(moved.Size(), 16u);
+            EXPECT_EQ(moved.Buffer()[0], 42);
+            moved.Close();
+            EXPECT_EQ(moved.Size(), 0u);
+        }
+        EXPECT_TRUE(file.Destroy());
+    }
+
 } // Core
 } // Tests
 } // Thunder

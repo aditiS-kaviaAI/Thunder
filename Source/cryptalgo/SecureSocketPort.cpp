@@ -172,7 +172,13 @@ Core::Time Certificate::ValidTill() const {
 bool Certificate::ValidHostname(const string& expectedHostname) const {
     ASSERT(_certificate != nullptr);
 
-    return (X509_check_host(const_cast<struct x509_st*>(_certificate), expectedHostname.data(), expectedHostname.size(), 0, nullptr) == 1);
+    if ((_certificate == nullptr) || expectedHostname.empty()) {
+        return false;
+    }
+    // Numeric addresses must match an IP SAN, never a DNS SAN or common name.
+    const int ip = X509_check_ip_asc(const_cast<struct x509_st*>(_certificate), expectedHostname.c_str(), 0);
+    return ((ip == 1) || ((ip == -2) && (X509_check_host(const_cast<struct x509_st*>(_certificate),
+        expectedHostname.data(), expectedHostname.size(), X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS, nullptr) == 1)));
 }
 
 // -----------------------------------------------------------------------------
@@ -266,13 +272,12 @@ static struct x509_store_st* CreateDefaultStore()
 {
     X509_STORE* store = X509_STORE_new();
 
-    const char* dir = getenv(X509_get_default_cert_dir_env());
-
-    if (dir == nullptr) {
-        dir = X509_get_default_cert_dir();
+    // OpenSSL owns platform defaults and SSL_CERT_FILE/SSL_CERT_DIR overrides.
+    // Loading only the hashed directory omits systems using a CA bundle.
+    if ((store != nullptr) && (X509_STORE_set_default_paths(store) != 1)) {
+        X509_STORE_free(store);
+        store = nullptr;
     }
-
-    X509_STORE_load_path(store, dir);
 
     return (store);
 }
@@ -330,6 +335,7 @@ SecureSocketPort::Handler::Handler(SecureSocketPort& parent,
     , _context(nullptr)
     , _ssl(nullptr)
     , _callback(nullptr)
+    , _server(false)
     , _handShaking(EXCHANGE) {
     CreateContext(TLS_method());
 }
@@ -347,6 +353,7 @@ SecureSocketPort::Handler::Handler(SecureSocketPort& parent,
     , _context(nullptr)
     , _ssl(nullptr)
     , _callback(nullptr)
+    , _server(true)
     , _handShaking(EXCHANGE) {
     CreateContext(TLS_server_method());
 }
@@ -368,6 +375,12 @@ SecureSocketPort::Handler::~Handler() {
 void SecureSocketPort::Handler::CreateContext(const struct ssl_method_st* method) {
     _context = SSL_CTX_new(method);
     if (_context != nullptr) {
+        SSL_CTX_set_options(_context, SSL_OP_ALL | SSL_OP_NO_SSLv2);
+        const CertificateStore roots = CertificateStore::Default();
+        auto* store = const_cast<x509_store_st*>(static_cast<const x509_store_st*>(roots));
+        if ((store != nullptr) && (X509_STORE_up_ref(store) == 1)) {
+            SSL_CTX_set_cert_store(_context, store);
+        }
         _ssl = SSL_new(_context);
 
         if (_ssl == nullptr) {
@@ -375,12 +388,20 @@ void SecureSocketPort::Handler::CreateContext(const struct ssl_method_st* method
             _context = nullptr;
         }
         else {
-            constexpr unsigned long options = SSL_OP_ALL | SSL_OP_NO_SSLv2;
-
-            VARIABLE_IS_NOT_USED unsigned long bitmask = SSL_CTX_set_options(_context, options);
-
-            ASSERT((bitmask & options) == options);
+            ConfigureVerification();
         }
+    }
+}
+
+void SecureSocketPort::Handler::ConfigureVerification() {
+    if (_ssl != nullptr) {
+        // Custom validators run after the handshake and intentionally own trust policy.
+        // Accepted sockets without a validator are ordinary TLS, not implicit mTLS.
+        const int mode = _server
+            ? (_callback != nullptr ? SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT : SSL_VERIFY_NONE)
+            : (_callback == nullptr ? SSL_VERIFY_PEER : SSL_VERIFY_NONE);
+        SSL_set_verify(_ssl, mode, (_server && (_callback != nullptr))
+            ? +[](int, X509_STORE_CTX*) -> int { return 1; } : nullptr);
     }
 }
 
@@ -391,11 +412,11 @@ uint32_t SecureSocketPort::Handler::Initialize() {
     ASSERT(_ssl != nullptr);
 
     if ((_context != nullptr) && (_ssl != nullptr) && (SSL_set_fd(_ssl, static_cast<Core::IResource&>(*this).Descriptor()) == 1)) {
-        SSL_set_tlsext_host_name(_ssl, RemoteNode().HostName().c_str());
-        if (IsOpen() == true) {
+        if (_server) {
             SSL_set_accept_state(_ssl);
         }
         else {
+            SSL_set_tlsext_host_name(_ssl, RemoteNode().EndpointIdentity().c_str());
             SSL_set_connect_state(_ssl);
         }
 
@@ -412,7 +433,9 @@ int32_t SecureSocketPort::Handler::Read(uint8_t buffer[], const uint16_t length)
     if (_handShaking != OPEN) {
         const_cast<Handler&>(*this).Update();
     }
- 
+    if (_handShaking != OPEN) {
+        return -1;
+    }
     return (SSL_read(_ssl, buffer, length));
 }
 
@@ -420,13 +443,13 @@ int32_t SecureSocketPort::Handler::Write(const uint8_t buffer[], const uint16_t 
 
     ASSERT(_handShaking != ERROR);
 
-    int32_t result = SSL_write(_ssl, buffer, length);
-
     if (_handShaking != OPEN) {
         Update();
     }
-
-    return (result);
+    if (_handShaking != OPEN) {
+        return -1;
+    }
+    return (SSL_write(_ssl, buffer, length));
 }
 
 uint32_t SecureSocketPort::Handler::Open(const uint32_t waitTime) {
@@ -447,9 +470,13 @@ uint32_t SecureSocketPort::Handler::Certificate(const Crypto::Certificate& certi
     const struct evp_pkey_st* base_key = key;
     uint32_t result = Core::ERROR_BAD_REQUEST;
 
-    if (SSL_CTX_use_certificate(_context, const_cast<struct x509_st*>(cert)) == 1) {
+    if ((_context != nullptr) && (_ssl != nullptr) && (cert != nullptr) && (base_key != nullptr)
+        && (SSL_CTX_use_certificate(_context, const_cast<struct x509_st*>(cert)) == 1)
+        && (SSL_use_certificate(_ssl, const_cast<struct x509_st*>(cert)) == 1)) {
         result = Core::ERROR_UNKNOWN_KEY;
-        if (SSL_CTX_use_PrivateKey(_context, const_cast<EVP_PKEY*>(base_key)) == 1) {
+        if ((SSL_CTX_use_PrivateKey(_context, const_cast<EVP_PKEY*>(base_key)) == 1)
+            && (SSL_use_PrivateKey(_ssl, const_cast<EVP_PKEY*>(base_key)) == 1)
+            && (SSL_check_private_key(_ssl) == 1)) {
             result = Core::ERROR_NONE;
         }
     }
@@ -461,7 +488,9 @@ uint32_t SecureSocketPort::Handler::Root(const CertificateStore& certStore) {
     const struct x509_store_st* store = certStore;
     uint32_t result = Core::ERROR_BAD_REQUEST;
 
-    if ((_context != nullptr) && (store != nullptr) && (X509_STORE_up_ref(const_cast<struct x509_store_st*>(store)) == 1)) {
+    if ((_context != nullptr) && (_ssl != nullptr) && (store != nullptr)
+        && (SSL_set1_verify_cert_store(_ssl, const_cast<struct x509_store_st*>(store)) == 1)
+        && (X509_STORE_up_ref(const_cast<struct x509_store_st*>(store)) == 1)) {
         SSL_CTX_set_cert_store(_context, const_cast<struct x509_store_st*>(store));
         result = Core::ERROR_NONE;
     }
@@ -473,7 +502,15 @@ void SecureSocketPort::Handler::ValidateHandShake() {
     // Step 1: verify a certificate was presented during the negotiation
     X509* x509cert = SSL_get_peer_certificate(_ssl);
 
-    if (x509cert == nullptr) {
+    if (_server && (_callback == nullptr)) {
+        // Client authentication is opt-in through a validator on accepted sockets.
+        _handShaking = OPEN;
+        _parent.StateChange();
+        if (x509cert != nullptr) {
+            X509_free(x509cert);
+        }
+    }
+    else if (x509cert == nullptr) {
         _handShaking = ERROR;
         SetError();
         _parent.StateChange();
@@ -497,7 +534,8 @@ void SecureSocketPort::Handler::ValidateHandShake() {
             }
         }
         // SSL handshake does an implicit verification, its result is:
-        else if ((error = SSL_get_verify_result(_ssl)) != X509_V_OK) {
+        else if (((error = SSL_get_verify_result(_ssl)) != X509_V_OK)
+            || !certificate.ValidHostname(RemoteNode().EndpointIdentity())) {
             // string errorMsg = X509_verify_cert_error_string(error);
             _handShaking = ERROR;
             SetError();
@@ -531,6 +569,8 @@ void SecureSocketPort::Handler::Update() {
                 }
                 else if (result != SSL_ERROR_WANT_READ) {
                     _handShaking = ERROR;
+                    SetError();
+                    _parent.StateChange();
                 }
             }
         }

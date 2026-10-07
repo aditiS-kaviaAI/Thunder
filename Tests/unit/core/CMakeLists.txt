@@ -98,6 +98,7 @@ add_executable(${TEST_RUNNER_NAME}
    test_thunderhost_thunderplugin.cpp
    test_cryptalgo.cpp
    test_jwt.cpp
+   test_p1_metrics.cpp
 )
 
 if(MESSAGING)
@@ -209,6 +210,11 @@ if(MESSAGING)
     target_link_libraries(${TEST_RUNNER_NAME}
         PRIVATE
             ${NAMESPACE}Messaging::${NAMESPACE}Messaging)
+endif()
+
+if(SECURE_SOCKET)
+    find_package(OpenSSL REQUIRED)
+    target_link_libraries(${TEST_RUNNER_NAME} PRIVATE OpenSSL::SSL OpenSSL::Crypto)
 endif()
 
 install(

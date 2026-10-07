@@ -21,6 +21,7 @@
 
 #include "Module.h"
 #include "Serialization.h"
+#include <limits>
 
 namespace Thunder {
 namespace Core {
@@ -79,7 +80,11 @@ namespace Core {
                 #ifndef __WINDOWS__
                 static_assert((STARTSIZE != 0) && (STARTSIZE != static_cast<uint32_t>(~0)), "This method can only be called if you specify an initial blocksize different than 0 or ~0");
                 #endif
-                ::memcpy(_data, copy._data, _bufferSize);
+                if (_data != nullptr && copy._data != nullptr && _bufferSize != 0) {
+                    ::memcpy(_data, copy._data, _bufferSize);
+                } else {
+                    _bufferSize = 0;
+                }
             }
             AllocatorType(AllocatorType<STARTSIZE, SIZETYPE>&& move)
                 : _bufferSize(move._bufferSize)
@@ -138,30 +143,35 @@ namespace Core {
                 ASSERT(index < _bufferSize);
                 return (_data[index]);
             }
-            inline void Allocate(SIZETYPE requiredSize)
+            inline bool Allocate(SIZETYPE requiredSize)
             {
-                RealAllocate(requiredSize, TemplateIntToType<STARTSIZE == 0 ? false : true>());
+                return RealAllocate(requiredSize, TemplateIntToType<STARTSIZE == 0 ? false : true>());
             }
+            const uint8_t* Data() const { return _data; }
 
         private:
-            inline void RealAllocate(const SIZETYPE requiredSize VARIABLE_IS_NOT_USED, const TemplateIntToType<false>& /* For compile time diffrentiation */)
+            inline bool RealAllocate(const SIZETYPE requiredSize, const TemplateIntToType<false>&)
             {
-                ASSERT(requiredSize <= _bufferSize);
+                return requiredSize <= _bufferSize && (requiredSize == 0 || _data != nullptr);
             }
-            inline void RealAllocate(const SIZETYPE requiredSize, const TemplateIntToType<true>& /* For compile time diffrentiation */)
+            inline bool RealAllocate(const SIZETYPE requiredSize, const TemplateIntToType<true>&)
             {
-                if (requiredSize > _bufferSize) {
-
-                    SIZETYPE bufferSize = static_cast<uint32_t>(((requiredSize / (STARTSIZE ? STARTSIZE : 1)) + 1) * STARTSIZE);
-
-                    // oops we need to "reallocate".
-                    uint8_t* data = reinterpret_cast<uint8_t*>(::realloc(_data, bufferSize));
-
-                    if (data != nullptr) {
-                        _data = data;
-                        _bufferSize = bufferSize;
-                    }
+                if (requiredSize == 0) {
+                    return true;
                 }
+                if (requiredSize > _bufferSize || _data == nullptr) {
+                    // Round in a wide type and cap at the representable capacity.
+                    const uint64_t maximum = static_cast<SIZETYPE>(~0);
+                    const uint64_t rounded = ((uint64_t(requiredSize) / STARTSIZE) + 1) * STARTSIZE;
+                    const SIZETYPE bufferSize = static_cast<SIZETYPE>(rounded > maximum ? maximum : rounded);
+                    uint8_t* data = static_cast<uint8_t*>(::realloc(_data, bufferSize));
+                    if (data == nullptr) {
+                        return false;
+                    }
+                    _data = data;
+                    _bufferSize = bufferSize;
+                }
+                return true;
             }
 
         private:
@@ -205,30 +215,32 @@ namespace Core {
             }
             inline uint32_t Length() const
             {
-                return (_container == nullptr ? 0 : _container->Size() - _offset);
+                return (_container == nullptr || _offset > _container->Size() ? 0 : _container->Size() - _offset);
             }
             SIZE_CONTEXT LockFixedBuffer(const uint8_t*& buffer, const uint32_t length) const
             {
-                ASSERT(_container != nullptr);
-                ASSERT(length <= Length());
-
+                buffer = nullptr;
+                if (_container == nullptr || length > Length() || length == 0) {
+                    return 0;
+                }
                 buffer = &(_container->operator[](_offset));
-
-                return (length < Length() ? Length() : length);
+                return static_cast<SIZE_CONTEXT>(length);
             }
             template <typename TYPENAME>
             TYPENAME LockBuffer(const uint8_t*& buffer) const
             {
-                TYPENAME result;
-
-                ASSERT(_container != nullptr);
-
-                _offset += _container->GetNumber<TYPENAME>(_offset, result);
-                ASSERT(result <= Length());
-
-                buffer = (result == 0 ? nullptr : &(_container->operator[](_offset)));
-
-                return (result);
+                TYPENAME result = 0;
+                buffer = nullptr;
+                if (_container == nullptr) {
+                    return 0;
+                }
+                const SIZE_CONTEXT prefix = _container->GetNumber<TYPENAME>(_offset, result);
+                if (prefix == 0 || uint64_t(result) > Length() - prefix) {
+                    return 0;
+                }
+                _offset += prefix;
+                buffer = result == 0 ? nullptr : &(_container->operator[](_offset));
+                return result;
             }
             template <typename TYPENAME>
             void UnlockBuffer(TYPENAME length) const
@@ -248,7 +260,7 @@ namespace Core {
                 result = _container->GetBuffer<TYPENAME>(_offset, maxLength, buffer);
                 _offset += result;
 
-                return (static_cast<TYPENAME>(result - Core::RealSize<TYPENAME>()));
+                return (result < Core::RealSize<TYPENAME>() ? 0 : static_cast<TYPENAME>(result - Core::RealSize<TYPENAME>()));
             }
             void Copy(const SIZE_CONTEXT length, uint8_t buffer[]) const
             {
@@ -270,11 +282,11 @@ namespace Core {
             template <typename TYPENAME>
             TYPENAME VariableNumber() const
             {
-                TYPENAME result;
-
-                ASSERT(_container != nullptr);
-
-                _offset += _container->GetVariableNumber<TYPENAME>(_offset, result);
+                TYPENAME result = 0;
+                if (_container != nullptr) {
+                    _offset += _container->GetVariableNumber<TYPENAME>(_offset, result);
+                }
+                return result;
             }
             bool Boolean() const
             {
@@ -448,9 +460,12 @@ namespace Core {
             #endif
         }
         FrameType(const FrameType<BLOCKSIZE, BIG_ENDIAN_ORDERING, SIZE_CONTEXT>& copy)
-            : _size(copy._size)
+            : _size(0)
             , _data(copy._data)
         {
+            if (_data.Data() != nullptr) {
+                _size = copy._size;
+            }
             // It looks like there is a bug in the windows compiler. It prepares a default/copy constructor
             // if the template being instantiated is not really utilizing it!
             #ifndef __WINDOWS__
@@ -470,7 +485,7 @@ namespace Core {
         }
 
         FrameType(uint8_t* buffer, const SIZE_CONTEXT length, const SIZE_CONTEXT loadedSize = 0)
-            : _size(loadedSize)
+            : _size(buffer != nullptr && loadedSize <= length ? loadedSize : 0)
             , _data(buffer, length)
         {
             // It looks like there is a bug in the windows compiler. It prepares a default/copy constructor
@@ -483,9 +498,11 @@ namespace Core {
 
         FrameType<BLOCKSIZE, BIG_ENDIAN_ORDERING, SIZE_CONTEXT>& operator=(const FrameType<BLOCKSIZE, BIG_ENDIAN_ORDERING, SIZE_CONTEXT>& rhs) {
             if (this != &rhs) {
-                Size(rhs.Size());
-                if (Size() > 0) {
-                    ::memcpy(&(_data[0]), rhs.Data(), Size());
+                if (_data.Allocate(rhs.Size())) {
+                    _size = rhs.Size();
+                    if (_size > 0) {
+                        ::memcpy(&(_data[0]), rhs.Data(), _size);
+                    }
                 }
             }
             return(*this);
@@ -510,7 +527,7 @@ namespace Core {
             return (_size);
         }
         inline const uint8_t* Data() const {
-            return (&_data[0]);
+            return _data.Data();
         }
         inline uint8_t& operator[](const SIZE_CONTEXT index)
         {
@@ -522,13 +539,14 @@ namespace Core {
         }
         void Size(SIZE_CONTEXT size)
         {
-            _data.Allocate(size);
-
-            _size = size;
+            if (_data.Allocate(size)) {
+                _size = size;
+            }
         }
         void Shrink(const SIZE_CONTEXT offset, const SIZE_CONTEXT size) {
-
-            ASSERT((offset + size) <= _size);
+            if (offset > _size || size > _size - offset) {
+                return;
+            }
 
             if (size > 0) {
                 if ((offset + size) == _size) {
@@ -541,28 +559,22 @@ namespace Core {
             }
         }
         void Expand(const SIZE_CONTEXT offset, const SIZE_CONTEXT size) {
-            ASSERT((offset + size) <= _size);
-
-            if (size > 0) {
-                if (offset == _size) {
-                    _size += size;
-                }
-                else {
-                    ::memmove(&(_data[offset + size]), &(_data[offset]), _size - offset);
-                    _size += size;
+            const SIZE_CONTEXT oldSize = _size;
+            if (offset <= oldSize && size > 0 && Ensure(uint64_t(oldSize) + size)) {
+                if (offset < oldSize) {
+                    ::memmove(&(_data[offset + size]), &(_data[offset]), oldSize - offset);
                 }
             }
-
         }
         template <typename TYPENAME>
         uint32_t SetBuffer(const SIZE_CONTEXT offset, const TYPENAME length, const uint8_t buffer[])
         {
-            SIZE_CONTEXT requiredLength(static_cast<SIZE_CONTEXT>(Core::RealSize<TYPENAME>() + length));
+            const uint64_t requiredLength = uint64_t(Core::RealSize<TYPENAME>()) + length;
 
             static_assert(Core::RealSize<TYPENAME>() <= sizeof(SIZE_CONTEXT), "Make sure the logic can handle the size (enlarge the SIZE_CONTEXT)");
 
-            if ((offset + requiredLength) >= _size) {
-                Size(offset + requiredLength);
+            if ((length != 0 && buffer == nullptr) || !Ensure(uint64_t(offset) + requiredLength)) {
+                return 0;
             }
 
             SetNumber<TYPENAME>(offset, length);
@@ -577,17 +589,23 @@ namespace Core {
 
         SIZE_CONTEXT Copy(const SIZE_CONTEXT offset, const SIZE_CONTEXT length, uint8_t buffer[]) const
         {
-            ASSERT(offset + length <= _size);
-
-            ::memcpy(buffer, &(_data[offset]), length);
+            if (offset > _size || length > _size - offset || (length != 0 && buffer == nullptr)) {
+                return 0;
+            }
+            if (length != 0) {
+                ::memcpy(buffer, &(_data[offset]), length);
+            }
 
             return (length);
         }
         SIZE_CONTEXT Copy(const SIZE_CONTEXT offset, const SIZE_CONTEXT length, const uint8_t buffer[])
         {
-            Size(offset + length);
-
-            ::memcpy(&(_data[offset]), buffer, length);
+            if ((length != 0 && buffer == nullptr) || !Ensure(uint64_t(offset) + length)) {
+                return 0;
+            }
+            if (length != 0) {
+                ::memcpy(&(_data[offset]), buffer, length);
+            }
 
             return (length);
         }
@@ -600,13 +618,18 @@ namespace Core {
 
         SIZE_CONTEXT SetNullTerminatedText(const SIZE_CONTEXT offset, const string& value, const SIZE_CONTEXT maxLength)
         {
-            std::string convertedText(Core::ToString(value).data(), (((maxLength != static_cast<SIZE_CONTEXT>(~0)) && ((value.length() + 1) > maxLength)) ? (maxLength - 1) : value.length()));
-            SIZE_CONTEXT requiredLength(static_cast<SIZE_CONTEXT>(convertedText.length() + 1));
-
-            if ((offset + requiredLength) >= _size) {
-                Size(offset + requiredLength);
+            if (maxLength == 0) {
+                return 0;
             }
-
+            std::string convertedText(Core::ToString(value));
+            if (maxLength != static_cast<SIZE_CONTEXT>(~0) && convertedText.size() >= maxLength) {
+                convertedText.resize(maxLength - 1);
+            }
+            const uint64_t required = convertedText.size() + 1;
+            if (!Ensure(uint64_t(offset) + required)) {
+                return 0;
+            }
+            const SIZE_CONTEXT requiredLength = static_cast<SIZE_CONTEXT>(required);
             ::memcpy(&(_data[offset]), convertedText.c_str(), requiredLength);
 
             return (requiredLength);
@@ -615,57 +638,57 @@ namespace Core {
         template <typename TYPENAME>
         SIZE_CONTEXT GetBuffer(const SIZE_CONTEXT offset, const TYPENAME length, uint8_t buffer[]) const
         {
-            TYPENAME textLength;
-
-            ASSERT((offset + Core::RealSize<TYPENAME>()) <= _size);
+            TYPENAME textLength = 0;
             static_assert(Core::RealSize<TYPENAME>() <= sizeof(SIZE_CONTEXT), "Make sure the logic can handle the size (enlarge the SIZE_CONTEXT)");
-
-            GetNumber<TYPENAME>(offset, textLength);
-
-            ASSERT((textLength + offset + Core::RealSize<TYPENAME>()) <= _size);
-
-            if ((textLength + offset + Core::RealSize<TYPENAME>()) > _size) {
-                textLength = (_size - (offset + Core::RealSize<TYPENAME>()));
+            const SIZE_CONTEXT prefix = GetNumber<TYPENAME>(offset, textLength);
+            if (prefix == 0 || uint64_t(textLength) > uint64_t(_size - offset - prefix)) {
+                return 0;
             }
-
-            memcpy(buffer, &(_data[offset + Core::RealSize<TYPENAME>()]), (textLength > length ? length : textLength));
-
-            return (static_cast<SIZE_CONTEXT>(Core::RealSize<TYPENAME>() + textLength));
+            const TYPENAME copied = textLength > length ? length : textLength;
+            if (copied != 0) {
+                if (buffer == nullptr) {
+                    return 0;
+                }
+                memcpy(buffer, &(_data[offset + prefix]), copied);
+            }
+            return static_cast<SIZE_CONTEXT>(prefix + textLength);
         }
 
         template <typename TYPENAME = uint16_t>
         SIZE_CONTEXT GetText(const SIZE_CONTEXT offset, string& result) const
         {
-            TYPENAME textLength;
-            ASSERT((offset + Core::RealSize<TYPENAME>()) <= _size);
+            TYPENAME textLength = 0;
+            result.clear();
             static_assert(Core::RealSize<TYPENAME>() <= sizeof(SIZE_CONTEXT), "Make sure the logic can handle the size (enlarge the SIZE_CONTEXT)");
-
-            GetNumber<TYPENAME>(offset, textLength);
-
-            ASSERT((textLength + offset + Core::RealSize<TYPENAME>()) <= _size);
-
-            if (textLength + offset + Core::RealSize<TYPENAME>() > _size) {
-                textLength = static_cast<TYPENAME>(_size - (offset + Core::RealSize<TYPENAME>()));
+            const SIZE_CONTEXT prefix = GetNumber<TYPENAME>(offset, textLength);
+            if (prefix == 0 || uint64_t(textLength) > uint64_t(_size - offset - prefix)) {
+                return 0;
             }
-
-            std::string convertedText(reinterpret_cast<const char*>(&(_data[offset + Core::RealSize<TYPENAME>()])), textLength);
-
-            result = Core::ToString(convertedText);
-
-            return (static_cast<SIZE_CONTEXT>(Core::RealSize<TYPENAME>() + textLength));
+            if (textLength != 0) {
+                result = Core::ToString(std::string(reinterpret_cast<const char*>(&(_data[offset + prefix])), textLength));
+            }
+            return static_cast<SIZE_CONTEXT>(prefix + textLength);
         }
 
         SIZE_CONTEXT GetNullTerminatedText(const SIZE_CONTEXT offset, string& result) const
         {
+            result.clear();
+            if (offset >= _size) {
+                return 0;
+            }
             const char* text = reinterpret_cast<const char*>(&(_data[offset]));
-            result = text;
-            return (static_cast<SIZE_CONTEXT>(result.length() + 1));
+            const char* end = static_cast<const char*>(::memchr(text, 0, _size - offset));
+            if (end == nullptr) {
+                return 0;
+            }
+            result = Core::ToString(std::string(text, end - text));
+            return static_cast<SIZE_CONTEXT>(end - text + 1);
         }
 
         SIZE_CONTEXT SetBoolean(const SIZE_CONTEXT offset, const bool value)
         {
-            if ((offset + 1) >= _size) {
-                Size(offset + 1);
+            if (!Ensure(uint64_t(offset) + 1)) {
+                return 0;
             }
 
             _data[offset] = (value ? 1 : 0);
@@ -675,8 +698,10 @@ namespace Core {
 
         SIZE_CONTEXT GetBoolean(const SIZE_CONTEXT offset, bool& value) const
         {
-            ASSERT(offset < _size);
-
+            value = false;
+            if (offset >= _size) {
+                return 0;
+            }
             value = (_data[offset] != 0);
 
             return (1);
@@ -691,15 +716,13 @@ namespace Core {
             static_assert(Core::RealSize<TYPENAME>() <= ((sizeof(bytes) * 7) / 8), "Make sure the size is not too large (not much bigger than uint64_t)");
 
             do {
-                bytes[index++] = ( static_cast<uint8_t>(value % 128) | 0x80 );
+                bytes[index++] = static_cast<uint8_t>(value % 128);
                 value /= 128;
 
             } while (value > 0);
 
-            bytes[index - 1] ^= 0x80;
-
-            if ((offset + index) >= _size) {
-                Size(offset + Core::RealSize<TYPENAME>());
+            if (!Ensure(uint64_t(offset) + index)) {
+                return 0;
             }
 
             if ( (BIG_ENDIAN_ORDERING == true) && (index > 1) ) {
@@ -708,22 +731,21 @@ namespace Core {
                     std::swap(bytes[step], bytes[index - 1 - step]);
                 }
             }
-
+            for (uint8_t step = 0; step + 1 < index; ++step) {
+                bytes[step] |= 0x80;
+            }
             ::memcpy(&(_data[offset]), bytes, index);
 
             return (index);
         }
 
         uint8_t GetVariableNumberLength(const SIZE_CONTEXT offset) const {
-            ASSERT(offset < _size);
-
-            uint8_t index = 0;
-
-            while (((offset + index) < _size) && ((_data[offset + index] & 0x80) != 0)) {
-                index++;
+            for (uint8_t index = 0; index < 10 && uint64_t(offset) + index < _size; ++index) {
+                if ((_data[offset + index] & 0x80) == 0) {
+                    return index + 1;
+                }
             }
-
-            return ((_data[offset + index] & 0x80) == 0 ? index + 1 : 0);
+            return 0;
         }
 
         static uint8_t VariableNumberLength(const uint64_t value) {
@@ -741,31 +763,23 @@ namespace Core {
         template <typename TYPENAME>
         inline SIZE_CONTEXT GetVariableNumber(const SIZE_CONTEXT offset, TYPENAME& number) const
         {
-            uint8_t index = 0;
             number = 0;
-
-            ASSERT(offset < _size);
-
-            while (((offset + index) < _size) && ((_data[offset + index] & 0x80) != 0)) {
-                index++;
+            const uint8_t length = GetVariableNumberLength(offset);
+            const uint64_t maximum = static_cast<uint64_t>(std::numeric_limits<TYPENAME>::max());
+            uint64_t value = 0;
+            if (length == 0 || length > (sizeof(TYPENAME) * 8 + 6) / 7) {
+                return 0;
             }
-
-            ASSERT(((index * 7) / 8) <= Core::RealSize<TYPENAME>());
-
-            ++index;
-
-            if (BIG_ENDIAN_ORDERING == false) {
-                uint8_t count = index;
-                while (count != 0) {
-                    count--;
-                    number = (number << 7) | ( (_data[offset + count]) & 0x7F);
+            for (uint8_t index = 0; index < length; ++index) {
+                const uint8_t position = BIG_ENDIAN_ORDERING ? index : length - 1 - index;
+                const uint8_t digit = _data[offset + position] & 0x7F;
+                if (value > (maximum >> 7) || (value == (maximum >> 7) && digit > (maximum & 0x7F))) {
+                    return 0;
                 }
+                value = (value << 7) | digit;
             }
-            else for (uint8_t pos = 0; pos < index; pos++) {
-                number = (number << 7) | ((_data[offset + pos]) & 0x7F);
-            }
-
-            return (index);
+            number = static_cast<TYPENAME>(value);
+            return length;
         }
 
         template <typename TYPENAME>
@@ -800,11 +814,22 @@ namespace Core {
 #endif
 
     private:
+        bool Ensure(const uint64_t end)
+        {
+            if (end > static_cast<SIZE_CONTEXT>(~0) || !_data.Allocate(static_cast<SIZE_CONTEXT>(end))) {
+                return false;
+            }
+            if (end > _size) {
+                _size = static_cast<SIZE_CONTEXT>(end);
+            }
+            return true;
+        }
+
         template <typename TYPENAME>
         SIZE_CONTEXT SetNumber(const SIZE_CONTEXT offset, const TYPENAME number, const TemplateIntToType<true>&)
         {
-            if ((offset + 1) >= _size) {
-                Size(offset + 1);
+            if (!Ensure(uint64_t(offset) + 1)) {
+                return 0;
             }
 
             _data[offset] = static_cast<uint8_t>(number);
@@ -836,8 +861,8 @@ namespace Core {
         template <typename TYPENAME>
         SIZE_CONTEXT SetNumber(const SIZE_CONTEXT offset, const TYPENAME number, const TemplateIntToType<false>&)
         {
-            if ((offset + Core::RealSize<TYPENAME>()) >= _size) {
-                Size(offset + Core::RealSize<TYPENAME>());
+            if (!Ensure(uint64_t(offset) + Core::RealSize<TYPENAME>())) {
+                return 0;
             }
 
             if (BIG_ENDIAN_ORDERING == true) {
@@ -861,9 +886,10 @@ namespace Core {
         template <typename TYPENAME>
         SIZE_CONTEXT GetNumber(const SIZE_CONTEXT offset, TYPENAME& number, const TemplateIntToType<true>&) const
         {
-            // Only on package level allowed to pass the boundaries!!!
-            ASSERT((offset + Core::RealSize<TYPENAME>()) <= _size);
-
+            number = static_cast<TYPENAME>(0);
+            if (offset >= _size) {
+                return 0;
+            }
             number = static_cast<TYPENAME>(_data[offset]);
 
             return (1);
@@ -902,8 +928,9 @@ namespace Core {
         template <typename TYPENAME>
         inline SIZE_CONTEXT GetNumber(const SIZE_CONTEXT offset, TYPENAME& value, const TemplateIntToType<false>&) const
         {
-            if ((offset + Core::RealSize<TYPENAME>()) > _size) {
+            if (uint64_t(offset) + Core::RealSize<TYPENAME>() > _size) {
                 value = static_cast<TYPENAME>(0);
+                return 0;
             }
             else if (BIG_ENDIAN_ORDERING == true) {
 #ifdef LITTLE_ENDIAN_PLATFORM

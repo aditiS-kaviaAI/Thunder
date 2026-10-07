@@ -80,31 +80,29 @@ namespace PluginHost {
     {
         Web::MIMETypes result;
         Web::EncodingTypes encoding = Web::ENCODING_UNKNOWN;
-        uint16_t offset = static_cast<uint16_t>(_config.WebPrefix().length()) + (_webURLPath.empty() ? 1 : static_cast<uint16_t>(_webURLPath.length()) + 2);
+        const size_t offset = _config.WebPrefix().length() + (_webURLPath.empty() ? 1 : _webURLPath.length() + 2);
         string fileToService = _webServerFilePath;
         if ((webServiceRequest.length() <= offset) || (Web::MIMETypeAndEncodingForFile(webServiceRequest.substr(offset, -1), fileToService, result, encoding) == false)) {
+            fileToService = _webServerFilePath + _T("index.html");
+            result = Web::MIME_HTML;
+            encoding = Web::ENCODING_UNKNOWN;
+        }
+        const string relative = Core::File::Normalize(fileToService.substr(_webServerFilePath.length()), !allowUnsafePath);
+        Core::File opened;
+        const bool valid = !relative.empty() && (allowUnsafePath
+            ? ((opened = fileToService), opened.Open(true))
+            : opened.OpenUnderRoot(_webServerFilePath, relative));
+        if (valid) {
             Core::ProxyType<Web::FileBody> fileBody(IFactories::Instance().FileBody());
-
-            // No filename gives, be default, we go for the index.html page..
-            *fileBody = fileToService + _T("index.html");
-            response.ContentType = Web::MIME_HTML;
+            *fileBody = opened;
+            response.ContentType = result;
+            if (encoding != Web::ENCODING_UNKNOWN) {
+                response.ContentEncoding = encoding;
+            }
             response.Body<Web::FileBody>(fileBody);
         } else {
-            ASSERT(fileToService.length() >= _webServerFilePath.length());
-            string normalizedPath = Core::File::Normalize(fileToService.substr(_webServerFilePath.length()), !allowUnsafePath);
-
-            if (normalizedPath.empty() == false) {
-                Core::ProxyType<Web::FileBody> fileBody(IFactories::Instance().FileBody());
-                *fileBody = fileToService;
-                response.ContentType = result;
-                if (encoding != Web::ENCODING_UNKNOWN) {
-                    response.ContentEncoding = encoding;
-                }
-                response.Body<Web::FileBody>(fileBody);
-            } else {
-                response.ErrorCode = Web::STATUS_BAD_REQUEST;
-                response.Message = "Invalid Request";
-            }
+            response.ErrorCode = Web::STATUS_BAD_REQUEST;
+            response.Message = "Invalid Request";
         }
     }
 

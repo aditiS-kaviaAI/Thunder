@@ -20,6 +20,8 @@
 #pragma once
 
 #include "processcontainers/common/BaseRefCount.h"
+#include <cerrno>
+#include <cstdlib>
 
 namespace Thunder {
 namespace ProcessContainers {
@@ -125,10 +127,14 @@ namespace ProcessContainers {
             auto fd = open(_memoryInfoPath.c_str(), O_RDONLY);
 
             if (fd >= 0) {
-                size_t bytesRead = read(fd, buffer, sizeof(buffer));
+                const ssize_t bytesRead = read(fd, buffer, sizeof(buffer) - 1);
 
                 if (bytesRead > 0) {
-                    result->Allocated(std::stoll(buffer));
+                    buffer[bytesRead] = '\0';
+                    uint64_t value;
+                    if (Parse(buffer, value)) {
+                        result->Allocated(value);
+                    }
                 }
 
                 close(fd);
@@ -141,9 +147,10 @@ namespace ProcessContainers {
 
             fd = open(memoryFullInfoPath.c_str(), O_RDONLY);
             if (fd >= 0) {
-                size_t bytesRead = read(fd, buffer, sizeof(buffer));
+                const ssize_t bytesRead = read(fd, buffer, sizeof(buffer) - 1);
 
                 if (bytesRead > 0) {
+                    buffer[bytesRead] = '\0';
                     char* tmp;
                     char* token = strtok_r(buffer, " \n", &tmp);
 
@@ -157,12 +164,13 @@ namespace ProcessContainers {
                         if (token == nullptr)
                             break;
 
-                        uint64_t value = std::stoll(token);
-
-                        if (strcmp(label, "rss") == 0)
-                            result->Resident(value);
-                        else if (strcmp(label, "mapped_file") == 0)
-                            result->Shared(value);
+                        uint64_t value;
+                        if (Parse(token, value)) {
+                            if (strcmp(label, "rss") == 0)
+                                result->Resident(value);
+                            else if (strcmp(label, "mapped_file") == 0)
+                                result->Shared(value);
+                        }
 
                         token = strtok_r(NULL, " \n", &tmp);
                     }
@@ -186,23 +194,23 @@ namespace ProcessContainers {
             char buffer[2048];
 
             if (fd >= 0) {
-                uint32_t bytesRead = read(fd, buffer, sizeof(buffer));
-
-                // In about 30% of cases we got additional number information after new line
-                for(uint32_t i = 0; buffer[i] != '\0'; i++) {
-                    if (buffer[i] == '\n') {
-                        buffer[i] = '\0';
-                    }
-                }
+                const ssize_t bytesRead = read(fd, buffer, sizeof(buffer) - 1);
 
                 if (bytesRead > 0) {
+                    buffer[bytesRead] = '\0';
+                    // Only the first line contains per-core counters.
+                    char* newline = static_cast<char*>(memchr(buffer, '\n', bytesRead));
+                    if (newline != nullptr) {
+                        *newline = '\0';
+                    }
                     char* tmp;
                     char* token = strtok_r((char*)buffer, " ", &tmp);
 
                     while (token != nullptr) {
                         // Sometimes (but not always for some reason?) a nonprintable character is caught as a separate token.
-                        if (isdigit(token[0])) {
-                            coresUsage.push_back(atoi(token));
+                        uint64_t value;
+                        if (Parse(token, value)) {
+                            coresUsage.push_back(value);
                         }
                         token = strtok_r(NULL, " ", &tmp);
                     }
@@ -215,6 +223,24 @@ namespace ProcessContainers {
         }
 
     private:
+        static bool Parse(const char* text, uint64_t& value)
+        {
+            if ((text == nullptr) || (*text < '0') || (*text > '9')) {
+                return false;
+            }
+            errno = 0;
+            char* end;
+            const unsigned long long parsed = strtoull(text, &end, 10);
+            while ((*end == '\n') || (*end == '\r') || (*end == ' ') || (*end == '\t')) {
+                ++end;
+            }
+            if ((errno != 0) || (*end != '\0')) {
+                return false;
+            }
+            value = static_cast<uint64_t>(parsed);
+            return true;
+        }
+
         string _name;
     };
 

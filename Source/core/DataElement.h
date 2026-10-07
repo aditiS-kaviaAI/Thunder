@@ -271,7 +271,10 @@ namespace Core {
             m_Offset = 0;
             m_Size = 0;
             m_Buffer = nullptr;
-            m_Storage.Release();
+            // File-backed and externally owned buffers have no storage proxy.
+            if (m_Storage.IsValid()) {
+                m_Storage.Release();
+            }
             m_MaxSize = 0;
         }
         template <typename TYPE>

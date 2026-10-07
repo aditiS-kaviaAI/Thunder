@@ -142,6 +142,15 @@ namespace ProcessContainers {
 
                 return (Execute(options));
             }
+            // PUBLIC_INTERFACE
+            uint32_t Start(const string& id) const
+            {
+                /** Start the bundle entrypoint of an already-created OCI container. */
+                Options options;
+                options.Add(_T("start")).Add(id);
+                return Execute(options);
+            }
+
             uint32_t Exec(const string& id, const string& bundlePath, const string& command, IStringIterator* parameters = nullptr) const
             {
                 ASSERT(id.empty() == false);
@@ -474,8 +483,15 @@ namespace ProcessContainers {
         uint32_t result = _runner->Create(_id, _path);
 
         if (result == Core::ERROR_NONE) {
-            result = _runner->Exec(_id, _path, command, &parameters);
+            result = _runner->Start(_id);
+            if (result == Core::ERROR_NONE) {
+                result = _runner->Exec(_id, _path, command, &parameters);
+            }
+            if (result != Core::ERROR_NONE) {
+                _runner->Delete(_id, DEFAULT_TIMEOUT);
+            }
         }
+        _pid = 0;
 
         _adminLock.Unlock();
 

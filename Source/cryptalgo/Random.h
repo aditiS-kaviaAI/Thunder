@@ -33,6 +33,8 @@
 // ---- Helper functions ----
 namespace Thunder {
 namespace Crypto {
+    // OS cryptographic entropy is used for every scalar overload. These legacy
+    // void APIs terminate on provider failure rather than returning weak output.
     extern EXTERNAL void Reseed();
     extern EXTERNAL void Random(uint8_t& value);
     extern EXTERNAL void Random(uint16_t& value);

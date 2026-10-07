@@ -43,7 +43,7 @@ namespace Core
         uint16_t srcLength = sourceLength;
         uint16_t dstLength = destinationLength;
 
-        while ((*source != '\0') && (srcLength != 0) && (dstLength != 0)) {
+        while ((srcLength != 0) && (dstLength != 0) && (*source != '\0')) {
             TCHAR current = *source++;
 
             if ((isalnum(current) != 0) || (current == '-') || (current == '_') || (current == '.') || (current == '~')) {
@@ -76,7 +76,7 @@ namespace Core
         uint16_t srcLength = sourceLength;
         uint16_t dstLength = destinationLength;
 
-        while ((*source != '\0') && (srcLength != 0) && (dstLength != 0)) {
+        while ((srcLength != 0) && (dstLength != 0) && (*source != '\0')) {
             TCHAR current = *source++;
 
             if (current == '%') {

@@ -351,6 +351,13 @@ namespace Core {
 
         string HostName() const;
 
+        // PUBLIC_INTERFACE
+        /** Return the supplied DNS name, or the numeric address, without reverse DNS. */
+        string EndpointIdentity() const
+        {
+            return m_hostName.empty() ? HostAddress() : m_hostName;
+        }
+
         NodeId AnyInterface() const;
         string HostAddress() const;
         string QualifiedName() const;

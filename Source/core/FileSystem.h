@@ -344,9 +344,21 @@ namespace Core {
             bool result;
 #ifdef __WINDOWS__
             LARGE_INTEGER position;
-            position.HighPart = (size >> 32);
-            position.LowPart = (size & 0xFFFFFFFF);
-            result = (SetFilePointerEx(_handle, position, nullptr, FILE_BEGIN) != 0);
+            LARGE_INTEGER previous;
+            LARGE_INTEGER zero;
+            zero.QuadPart = 0;
+            position.QuadPart = static_cast<LONGLONG>(size);
+            result = false;
+            if (size <= 0x7FFFFFFFFFFFFFFFULL
+                && ::SetFilePointerEx(_handle, zero, &previous, FILE_CURRENT)) {
+                if (::SetFilePointerEx(_handle, position, nullptr, FILE_BEGIN)) {
+                    result = (::SetEndOfFile(_handle) != FALSE);
+                    // Match ftruncate: resizing must not move the caller's cursor.
+                    if (!::SetFilePointerEx(_handle, previous, nullptr, FILE_BEGIN)) {
+                        result = false;
+                    }
+                }
+            }
 #else
             result = (ftruncate(_handle, size) != -1);
 #endif
@@ -376,7 +388,7 @@ namespace Core {
             _handle = open(_name.c_str(), O_CLOEXEC | O_RDWR | O_CREAT | O_TRUNC | (exclusive ? O_EXCL : 0), mode);
 #endif
 #ifdef __WINDOWS__
-            _handle = ::CreateFile(_name.c_str(), (GENERIC_READ | GENERIC_WRITE), (exclusive ? 0 : (FILE_SHARE_READ | FILE_SHARE_WRITE)), nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+            _handle = ::CreateFile(_name.c_str(), (GENERIC_READ | GENERIC_WRITE), (exclusive ? 0 : (FILE_SHARE_READ | FILE_SHARE_WRITE)), nullptr, (exclusive ? CREATE_NEW : CREATE_ALWAYS), FILE_ATTRIBUTE_NORMAL, nullptr);
 #endif
             LoadFileInfo();
             return (IsOpen());
@@ -421,6 +433,95 @@ namespace Core {
 #endif
             return (IsOpen());
         }
+        // PUBLIC_INTERFACE
+        bool OpenUnderRoot(const string& root, const string& relative)
+        {
+            /** Open a regular file within root for reading, retaining the checked handle.
+             * Parameters: trusted root directory and normalized relative pathname.
+             * Returns false for invalid paths, links, unsupported platforms, or open failure.
+             */
+            if (IsOpen() || root.empty() || relative.empty() || IsPathAbsolute(relative)
+                || (relative.find('\0') != string::npos) || (relative.find('\\') != string::npos)) {
+                return false;
+            }
+#ifdef __POSIX__
+            int directory = open(root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+            if (directory < 0) {
+                return false;
+            }
+            size_t start = 0;
+            int opened = -1;
+            for (;;) {
+                const size_t separator = relative.find('/', start);
+                const string component = relative.substr(start, separator == string::npos ? string::npos : separator - start);
+                if (component.empty() || (component == ".") || (component == "..")) {
+                    break;
+                }
+                const bool last = separator == string::npos;
+                opened = openat(directory, component.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW
+                    | (last ? O_NONBLOCK : O_DIRECTORY));
+                if ((opened < 0) || last) {
+                    break;
+                }
+                close(directory);
+                directory = opened;
+                opened = -1;
+                start = separator + 1;
+            }
+            close(directory);
+            struct stat information;
+            if ((opened < 0) || (fstat(opened, &information) != 0) || !S_ISREG(information.st_mode)) {
+                if (opened >= 0) {
+                    close(opened);
+                }
+                return false;
+            }
+            _handle = opened;
+            _name = root + "/" + relative;
+            LoadFileInfo();
+            return true;
+#elif defined(__WINDOWS__)
+            HANDLE directory = ::CreateFile(root.c_str(), FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+            if (directory == INVALID_HANDLE_VALUE) {
+                return false;
+            }
+            HANDLE candidate = ::CreateFile((root + "/" + relative).c_str(), GENERIC_READ,
+                FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            bool valid = false;
+            if (candidate != INVALID_HANDLE_VALUE) {
+                BY_HANDLE_FILE_INFORMATION info;
+                TCHAR rootName[32768];
+                TCHAR fileName[32768];
+                const DWORD rootLength = ::GetFinalPathNameByHandle(directory, rootName, 32768, FILE_NAME_NORMALIZED);
+                const DWORD fileLength = ::GetFinalPathNameByHandle(candidate, fileName, 32768, FILE_NAME_NORMALIZED);
+                if ((rootLength > 0) && (rootLength < 32768) && (fileLength > 0) && (fileLength < 32768)
+                    && ::GetFileInformationByHandle(candidate, &info)
+                    && ((info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0)) {
+                    string prefix(rootName, rootLength);
+                    if (prefix.back() != '\\') {
+                        prefix += '\\';
+                    }
+                    valid = (fileLength > prefix.size())
+                        && (_tcsnicmp(fileName, prefix.c_str(), prefix.size()) == 0);
+                }
+                if (!valid) {
+                    ::CloseHandle(candidate);
+                }
+            }
+            ::CloseHandle(directory);
+            if (valid) {
+                _handle = candidate;
+                _name = root + "/" + relative;
+                LoadFileInfo();
+            }
+            return valid;
+#else
+            return false;
+#endif
+        }
+
         bool Unlink()
         {
             bool result = true;
@@ -823,34 +924,82 @@ POP_WARNING()
         }
 
         bool Destroy () {
-
-            // Allow only if the path does not contain ".." entries
+            if (_name.empty()) {
+                return false;
+            }
             Reset();
-
+#ifdef __LINUX__
+            string path = _name;
+            while ((path.size() > 1) && (path.back() == '/')) {
+                path.pop_back();
+            }
+            if ((path == "/") || (path == ".") || (path == "..")) {
+                return false;
+            }
+            const int descriptor = open(path.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            if (descriptor < 0) {
+                return false;
+            }
+            const bool cleared = DestroyContents(descriptor);
+            close(descriptor);
+            return cleared && ((_name.back() == '/') || (rmdir(path.c_str()) == 0));
+#else
+#ifdef __WINDOWS__
+            // Denying delete sharing prevents this directory from being replaced
+            // while pathname-based child enumeration is in progress.
+            HANDLE guard = ::CreateFile(_name.c_str(), FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+            BY_HANDLE_FILE_INFORMATION rootInfo;
+            if (guard == INVALID_HANDLE_VALUE) {
+                return false;
+            }
+            if (!::GetFileInformationByHandle(guard, &rootInfo)
+                || ((rootInfo.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
+                || ((rootInfo.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)) {
+                ::CloseHandle(guard);
+                return false;
+            }
+            noMoreFiles = false;
+#endif
+            bool result = true;
             while (Next() == true) {
+                if ((Name() == ".") || (Name() == "..")) {
+                    continue;
+                }
                 Core::File file(Current());
-
-                if (file.IsDirectory() == true) {
-                    string name(file.FileName());
-
-                    // We can not delete the "." or  ".." entries....
-                    if ( (name.length() > 2) || 
-                            ((name.length() == 1) && (name[0] != '.')) ||
-                            ((name.length() == 2) && !((name[0] == '.') && (name[1] == '.'))) ) {
-                        Directory deleteIt(Current().c_str());
-                        deleteIt.Destroy();
-                        file.Destroy();
+                if (file.IsDirectory()) {
+                    if (!file.IsLink()) {
+                        Directory child(Current().c_str());
+                        if (!child.Destroy()) {
+                            result = false;
+                            continue;
+                        }
+                        // The recursive call already removed this child.
+                        continue;
                     }
+#ifdef __WINDOWS__
+                    result = (::RemoveDirectory(Current().c_str()) != FALSE) && result;
+#else
+                    result = file.Destroy() && result;
+#endif
                 } else {
-                    file.Destroy();
+                    result = file.Destroy() && result;
                 }
             }
-
+#ifdef __WINDOWS__
+            Reset();
+            ::CloseHandle(guard);
+#endif
             if (_name.back() != '/') {
-                Core::File(_name).Destroy();
+#ifdef __WINDOWS__
+                result = (::RemoveDirectory(_name.c_str()) != FALSE) && result;
+#else
+                result = Core::File(_name).Destroy() && result;
+#endif
             }
-
-            return (true);
+            return result;
+#endif
         }
 
         uint32_t User(const string& userName) const;
@@ -858,6 +1007,52 @@ POP_WARNING()
         uint32_t Permission(uint16_t flags) const;
 
     private:
+#ifdef __LINUX__
+        static bool DestroyContents(const int descriptor)
+        {
+            const int duplicate = dup(descriptor);
+            if (duplicate < 0) {
+                return false;
+            }
+            DIR* entries = fdopendir(duplicate);
+            if (entries == nullptr) {
+                close(duplicate);
+                return false;
+            }
+            bool result = true;
+            for (;;) {
+                errno = 0;
+                dirent* entry = readdir(entries);
+                if (entry == nullptr) {
+                    result = (errno == 0) && result;
+                    break;
+                }
+                if ((strcmp(entry->d_name, ".") == 0) || (strcmp(entry->d_name, "..") == 0)) {
+                    continue;
+                }
+                struct stat information;
+                if (fstatat(descriptor, entry->d_name, &information, AT_SYMLINK_NOFOLLOW) != 0) {
+                    result = false;
+                    continue;
+                }
+                if (S_ISDIR(information.st_mode)) {
+                    const int child = openat(descriptor, entry->d_name,
+                        O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+                    if (child < 0) {
+                        result = false;
+                        continue;
+                    }
+                    const bool cleared = DestroyContents(child);
+                    close(child);
+                    result = cleared && (unlinkat(descriptor, entry->d_name, AT_REMOVEDIR) == 0) && result;
+                } else {
+                    result = (unlinkat(descriptor, entry->d_name, 0) == 0) && result;
+                }
+            }
+            closedir(entries);
+            return result;
+        }
+#endif
         string _name;
         string _filter;
 

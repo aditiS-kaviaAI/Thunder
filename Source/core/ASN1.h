@@ -25,6 +25,8 @@
 // ---- Include local include files ----
 #include "Module.h"
 #include "Portability.h"
+#include <memory>
+#include <limits>
 
 // ---- Referenced classes and types ----
 
@@ -48,7 +50,8 @@ namespace Core {
             {
             }
             Buffer(const uint16_t length)
-                : _buffer(length == 0 ? nullptr : new uint8_t[length + AdminSize])
+                : _owner(length == 0 ? nullptr : new uint8_t[length + AdminSize], std::default_delete<uint8_t[]>())
+                , _buffer(_owner.get())
             {
                 if (_buffer != nullptr) {
                     _buffer[0] = 1;
@@ -59,34 +62,33 @@ namespace Core {
                 }
             }
             Buffer(const Buffer& copy)
-                : _buffer(copy._buffer)
+                : _owner(copy._owner)
+                , _buffer(_owner.get())
             {
-                AddRef();
             }
             Buffer(Buffer&& move) noexcept
-                : _buffer(move._buffer)
+                : _owner(std::move(move._owner))
+                , _buffer(_owner.get())
             {
                 move._buffer = nullptr;
             }
             ~Buffer()
             {
-                Release();
             }
 
             Buffer& operator=(const Buffer& RHS)
             {
                 if (&RHS != this) {
-                    Release();
-                    _buffer = RHS._buffer;
-                    AddRef();
+                    _owner = RHS._owner;
+                    _buffer = _owner.get();
                 }
                 return (*this);
             }
             Buffer& operator=(Buffer&& move) noexcept
             {
                 if (&move != this) {
-                    Release();
-                    _buffer = move._buffer;
+                    _owner = std::move(move._owner);
+                    _buffer = _owner.get();
                     move._buffer = nullptr;
                 }
                 return (*this);
@@ -96,9 +98,7 @@ namespace Core {
         public:
             inline void Size(const uint16_t length)
             {
-                ASSERT((_buffer != nullptr) && (length < ((_buffer[4] << 8) | _buffer[3])));
-
-                if (_buffer != nullptr) {
+                if (_buffer != nullptr && length <= ((_buffer[4] << 8) | _buffer[3])) {
                     _buffer[1] = (length & 0xFF);
                     _buffer[2] = ((length >> 8) & 0xFF);
                 }
@@ -120,24 +120,7 @@ namespace Core {
             }
 
         private:
-            void AddRef()
-            {
-                if (_buffer != nullptr) {
-                    _buffer[0] = _buffer[0] + 1;
-                }
-            }
-            void Release()
-            {
-                if (_buffer != nullptr) {
-                    if (_buffer[0] == 1) {
-                        delete[] _buffer;
-                    } else {
-                        _buffer[0] = _buffer[0] - 1;
-                    }
-                }
-            }
-
-        private:
+            std::shared_ptr<uint8_t> _owner;
             uint8_t* _buffer;
         };
 
@@ -199,7 +182,9 @@ namespace Core {
             public:
                 inline bool IsValid() const
                 {
-                    return (((_index == 0xFFFE) && (_length > 0)) || (_index < _length));
+                    uint16_t value;
+                    uint16_t end;
+                    return Decode(_index == 0xFFFE ? 0 : _index, value, end);
                 }
                 inline void Reset()
                 {
@@ -211,44 +196,61 @@ namespace Core {
                         _index = 0xFFFE;
                     } else if (_index == 0xFFFE) {
                         _index = 0;
-                    } else
-                        while ((_index < _length) && ((_buffer[_index] & 0x80) != 0)) {
-                            _index++;
-                        }
+                    } else {
+                        uint16_t value;
+                        uint16_t end;
+                        _index = Decode(_index, value, end) ? end : _length;
+                    }
 
                     return (IsValid());
                 }
                 inline uint16_t Number() const
                 {
-                    ASSERT(IsValid());
-
-                    if (_index == 0xFFFE) {
-                        return (_buffer[0] / 40);
-                    } else if (_index == 0) {
-                        return (_buffer[0] % 40);
-                    } else if (_buffer[_index] <= 127) {
-                        return (_buffer[_index]);
+                    uint16_t value = 0;
+                    uint16_t end;
+                    if (!Decode(_index == 0xFFFE ? 0 : _index, value, end)) {
+                        return 0;
                     }
-
-                    return (((_buffer[_index] & 0x7F) << 7) | (_buffer[_index + 1] & 0x7F));
+                    if (_index == 0xFFFE) {
+                        return value < 80 ? value / 40 : 2;
+                    } else if (_index == 0) {
+                        return value < 80 ? value % 40 : value - 80;
+                    }
+                    return value;
                 }
                 inline uint16_t Count() const
                 {
                     uint16_t result = 0;
-                    uint16_t index = 1;
-
-                    while (index < _length) {
-                        if (_buffer[index] > 127) {
-                            index++;
-                        }
-                        index++;
-                        result++;
+                    Iterator copy(_buffer, _length);
+                    while (copy.Next()) {
+                        ++result;
                     }
-
-                    return (2 + result);
+                    return result;
                 }
 
             private:
+                bool Decode(uint16_t index, uint16_t& value, uint16_t& end) const
+                {
+                    value = 0;
+                    if (_buffer == nullptr) {
+                        return false;
+                    }
+                    while (index < _length) {
+                        const uint8_t byte = _buffer[index++];
+                        const uint8_t digit = byte & 0x7F;
+                        if (value > (UINT16_MAX >> 7)
+                            || (value == (UINT16_MAX >> 7) && digit > (UINT16_MAX & 0x7F))) {
+                            return false;
+                        }
+                        value = static_cast<uint16_t>((value << 7) | digit);
+                        if ((byte & 0x80) == 0) {
+                            end = index;
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+
                 uint16_t _length;
                 uint16_t _index;
                 const uint8_t* _buffer;
@@ -370,10 +372,10 @@ namespace Core {
                     string textValue;
                     uint16_t value = index.Number();
 
-                    while (value > 0) {
+                    do {
                         textValue = static_cast<char>((value % 10) + '0') + textValue;
                         value /= 10;
-                    }
+                    } while (value > 0);
 
                     if (result.empty() == true) {
                         result = textValue;
@@ -506,36 +508,35 @@ namespace Core {
             }
             inline bool IsValid() const
             {
-                return ((_index > 0) && (_index < _length));
+                // This compact parser supports short-form lengths only.
+                return _index > 0 && _index < _length && _length <= _buffer.Size()
+                    && (_buffer[_index] & 0x80) == 0
+                    && uint32_t(_buffer[_index]) <= _length - _index - 1;
             }
             inline bool Next()
             {
                 if (_index == 0) {
                     _index++;
-                } else if (_index < _length) {
+                } else if (IsValid()) {
                     // Time to jump over the section, if possible.
-                    _index += (Length() + 1);
+                    _index += (Length() + 2);
+                } else {
+                    _index = _length;
                 }
 
                 return (IsValid() == true);
             }
             inline enumType Tag() const
             {
-                ASSERT(IsValid() == true);
-
-                return (static_cast<enumType>(_buffer[_index - 1]));
+                return IsValid() ? static_cast<enumType>(_buffer[_index - 1]) : TYPE_NULL;
             }
             inline uint8_t Length() const
             {
-                ASSERT(IsValid() == true);
-
-                return (static_cast<enumType>(_buffer[_index]));
+                return IsValid() ? _buffer[_index] : 0;
             }
             inline const uint8_t* Data() const
             {
-                ASSERT(IsValid() == true);
-
-                return (&(_buffer[_index + 1]));
+                return IsValid() && Length() != 0 ? &(_buffer[_index + 1]) : nullptr;
             }
 
             //-----------------------------------------------------
@@ -543,6 +544,9 @@ namespace Core {
             //-----------------------------------------------------
             inline enumError Value(bool& value) const
             {
+                if (!IsValid()) return ASN1_OUT_OF_DATA;
+                if (Tag() != TYPE_BOOLEAN) return ASN1_UNEXPECTED_TAG;
+                if (Length() != 1) return ASN1_INVALID_LENGTH;
                 ASSERT(Tag() == TYPE_BOOLEAN);
                 ASSERT(Length() == 1);
 
@@ -555,12 +559,18 @@ namespace Core {
             //-----------------------------------------------------
             inline enumError Value(signed char& value) const
             {
+                if (!IsValid()) return ASN1_OUT_OF_DATA;
+                if (Tag() != TYPE_INTEGER) return ASN1_UNEXPECTED_TAG;
+                if (Length() == 0 || Length() > sizeof(value)) return ASN1_INVALID_LENGTH;
                 ASSERT(Tag() == TYPE_INTEGER);
                 value = _buffer[_index + 1];
                 return (Length() <= 1 ? ASN1_OK : ASN1_BUF_TOO_SMALL);
             }
             inline enumError Value(unsigned char& value) const
             {
+                if (!IsValid()) return ASN1_OUT_OF_DATA;
+                if (Tag() != TYPE_INTEGER) return ASN1_UNEXPECTED_TAG;
+                if (Length() == 0 || Length() > sizeof(value)) return ASN1_INVALID_LENGTH;
                 ASSERT(Tag() == TYPE_INTEGER);
                 value = _buffer[_index + 1];
                 return (Length() <= 1 ? ASN1_OK : ASN1_BUF_TOO_SMALL);
@@ -570,6 +580,9 @@ namespace Core {
             //-----------------------------------------------------
             inline enumError Value(int16_t& value) const
             {
+                if (!IsValid()) return ASN1_OUT_OF_DATA;
+                if (Tag() != TYPE_INTEGER) return ASN1_UNEXPECTED_TAG;
+                if (Length() == 0 || Length() > sizeof(value)) return ASN1_INVALID_LENGTH;
                 ASSERT(Tag() == TYPE_INTEGER);
                 value = _buffer[_index + 1];
                 if (Length() > 1) {
@@ -579,6 +592,9 @@ namespace Core {
             }
             inline enumError Value(uint16_t& value) const
             {
+                if (!IsValid()) return ASN1_OUT_OF_DATA;
+                if (Tag() != TYPE_INTEGER) return ASN1_UNEXPECTED_TAG;
+                if (Length() == 0 || Length() > sizeof(value)) return ASN1_INVALID_LENGTH;
                 ASSERT(Tag() == TYPE_INTEGER);
                 value = _buffer[_index + 1];
                 if (Length() > 1) {
@@ -591,6 +607,9 @@ namespace Core {
             //-----------------------------------------------------
             inline enumError Value(uint32_t& value) const
             {
+                if (!IsValid()) return ASN1_OUT_OF_DATA;
+                if (Tag() != TYPE_INTEGER) return ASN1_UNEXPECTED_TAG;
+                if (Length() == 0 || Length() > sizeof(value)) return ASN1_INVALID_LENGTH;
                 ASSERT(Tag() == TYPE_INTEGER);
                 value = _buffer[_index + 1];
                 if (Length() > 1) {
@@ -606,6 +625,9 @@ namespace Core {
             }
             inline enumError Value(int32_t& value) const
             {
+                if (!IsValid()) return ASN1_OUT_OF_DATA;
+                if (Tag() != TYPE_INTEGER) return ASN1_UNEXPECTED_TAG;
+                if (Length() == 0 || Length() > sizeof(value)) return ASN1_INVALID_LENGTH;
                 ASSERT(Tag() == TYPE_INTEGER);
                 value = _buffer[_index + 1];
                 if (Length() > 1) {
@@ -624,6 +646,9 @@ namespace Core {
             //-----------------------------------------------------
             inline enumError Value(uint64_t& value) const
             {
+                if (!IsValid()) return ASN1_OUT_OF_DATA;
+                if (Tag() != TYPE_INTEGER) return ASN1_UNEXPECTED_TAG;
+                if (Length() == 0 || Length() > sizeof(value)) return ASN1_INVALID_LENGTH;
                 ASSERT(Tag() == TYPE_INTEGER);
                 value = _buffer[_index + 1];
                 if (Length() > 1) {
@@ -651,6 +676,9 @@ namespace Core {
             }
             inline enumError Value(int64_t& value) const
             {
+                if (!IsValid()) return ASN1_OUT_OF_DATA;
+                if (Tag() != TYPE_INTEGER) return ASN1_UNEXPECTED_TAG;
+                if (Length() == 0 || Length() > sizeof(value)) return ASN1_INVALID_LENGTH;
                 ASSERT(Tag() == TYPE_INTEGER);
                 value = _buffer[_index + 1];
                 if (Length() > 1) {
@@ -681,6 +709,9 @@ namespace Core {
             //-----------------------------------------------------
             inline enumError Value(OID& value) const
             {
+                if (!IsValid()) return ASN1_OUT_OF_DATA;
+                if (Tag() != TYPE_OID) return ASN1_UNEXPECTED_TAG;
+                if (Length() == 0) return ASN1_INVALID_LENGTH;
                 ASSERT(Tag() == TYPE_OID);
                 value = OID(&_buffer[_index + 1], Length());
 
@@ -691,6 +722,12 @@ namespace Core {
             //-----------------------------------------------------
             inline enumError Value(string& value) const
             {
+                if (!IsValid()) return ASN1_OUT_OF_DATA;
+                if (Tag() != TYPE_UTF8_STRING) return ASN1_UNEXPECTED_TAG;
+                if (Length() == 0) {
+                    value.clear();
+                    return ASN1_OK;
+                }
                 ASSERT(Tag() == TYPE_UTF8_STRING);
                 value = string(reinterpret_cast<const char*>(&_buffer[_index + 1]), Length());
 
@@ -701,9 +738,13 @@ namespace Core {
             //-----------------------------------------------------
             inline enumError Value(Sequence& value) const
             {
-                ASSERT(Tag() == TYPE_SEQUENCE);
-                value = Sequence(_buffer, _index, Length());
-
+                if (!IsValid()) return ASN1_OUT_OF_DATA;
+                if (Tag() != TYPE_SEQUENCE && Tag() != (TYPE_SEQUENCE | TYPE_CONSTRUCTED)) return ASN1_UNEXPECTED_TAG;
+                Buffer content(Length());
+                for (uint16_t index = 0; index < Length(); ++index) {
+                    content[index] = _buffer[_index + 1 + index];
+                }
+                value = Sequence(content);
                 return (ASN1_OK);
             }
 

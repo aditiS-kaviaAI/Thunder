@@ -374,15 +374,15 @@ namespace Core {
         struct stat sb;
         size_t len;
 
-        /* copy path */
-        strncpy(tmp, _name.c_str(), sizeof(tmp) - 1);
-        len = strlen(tmp);
-        if (len >= sizeof(tmp)) {
+        /* Validate before copying or indexing the final character. */
+        len = _name.size();
+        if (len == 0 || len >= sizeof(tmp)) {
             return false;
         }
+        memcpy(tmp, _name.c_str(), len + 1);
 
         /* remove trailing slash */
-        if (tmp[len - 1] == '/') {
+        if (len > 1 && tmp[len - 1] == '/') {
             tmp[len - 1] = 0;
         }
 

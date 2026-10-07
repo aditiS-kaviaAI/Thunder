@@ -26,6 +26,18 @@
 namespace Thunder {
 namespace Tests {
 
+    TEST(URL_P1, LengthDelimitedInput)
+    {
+        TCHAR output[16] = {};
+        EXPECT_EQ(Core::URL::Encode(nullptr, 0, output, 16), 0u);
+        EXPECT_EQ(Core::URL::Decode(nullptr, 0, output, 16), 0u);
+        const TCHAR exact[1] = { 'a' };
+        EXPECT_EQ(Core::URL::Encode(exact, 1, output, 16), 1u);
+        EXPECT_EQ(output[0], 'a');
+        EXPECT_EQ(Core::URL::Decode(exact, 1, output, 16), 1u);
+        EXPECT_EQ(output[0], 'a');
+    }
+
     // Test key: 32 bytes for HMAC-SHA256
     static const uint8_t TestKey[32] = {
         0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
@@ -427,6 +439,21 @@ namespace Tests {
         uint16_t decodedLen = jwt.Decode(token, sizeof(decoded), decoded);
         ASSERT_NE(decodedLen, static_cast<uint16_t>(~0));
         EXPECT_EQ(string(reinterpret_cast<const char*>(decoded), decodedLen), payload);
+    }
+
+    TEST(JWT_LargePayload, RejectsExpansionOverflow)
+    {
+        Web::JSONWebToken jwt(Web::JSONWebToken::SHA256, sizeof(TestKey), TestKey);
+        for (size_t length : { size_t(49149), size_t(49152), size_t(65535) }) {
+            string payload(length, 'X');
+            string token = "old";
+            EXPECT_EQ(jwt.Encode(token, static_cast<uint16_t>(length),
+                reinterpret_cast<const uint8_t*>(payload.data())), 0u);
+            EXPECT_TRUE(token.empty());
+        }
+        uint8_t output[1] = { 0xA5 };
+        EXPECT_EQ(jwt.Decode(string(1000000, 'A') + ".x.y", 1, output), static_cast<uint16_t>(~0));
+        EXPECT_EQ(output[0], 0xA5);
     }
 
 } // namespace Tests

@@ -342,12 +342,16 @@ static bool IsIPv6Address(const TCHAR hostname[]) {
             m_structInfo.IPV4Socket.in_protocol = protocol;
             if (IsIPv4Address(strHostName) == false) {
                 m_hostName = strHostName;
+            } else {
+                m_hostName = HostAddress();
             }
         }
         else if (m_structInfo.IPV4Socket.sin_family == AF_INET6) {
             m_structInfo.IPV6Socket.in_protocol = protocol;
             if (IsIPv6Address(strHostName) == false) {
                 m_hostName = strHostName;
+            } else {
+                m_hostName = HostAddress();
             }
         }
     }
@@ -383,7 +387,7 @@ static bool IsIPv6Address(const TCHAR hostname[]) {
         } else
 #endif
         {
-            const TCHAR* portNumber;
+            const TCHAR* portNumber = nullptr;
             const TCHAR* end;
             const TCHAR* start(strchr(strHostName, '['));
 
@@ -436,9 +440,13 @@ static bool IsIPv6Address(const TCHAR hostname[]) {
             else if (m_structInfo.IPV4Socket.sin_family == AF_INET6) {
                 m_structInfo.IPV6Socket.in_protocol = protocol;
                 if (IsIPv6Address(strHostName) == false) {
-                    m_hostName = string(strHostName).substr(0, static_cast<uint32_t>(portNumber - strHostName));;
+                    m_hostName = portNumber == nullptr ? string(strHostName)
+                        : string(strHostName).substr(0, static_cast<uint32_t>(portNumber - strHostName));
                 }
 
+            }
+            if (m_hostName.empty() && IsValid()) {
+                m_hostName = HostAddress();
             }
         }
     }

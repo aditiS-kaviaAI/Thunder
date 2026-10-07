@@ -78,10 +78,17 @@ namespace Core {
     }
 
     DataElementFile::DataElementFile(const DataElementFile& copy)
-        : DataElement(copy)
+        : DataElement()
         , m_File(copy.m_File)
-        , m_MemoryMappedFile(copy.m_MemoryMappedFile)
+        , m_MemoryMappedFile(INVALID_HANDLE_VALUE)
         , m_Flags(copy.m_Flags) {
+        if (m_File.IsOpen() && copy.Size() != 0) {
+            OpenMemoryMappedFile(static_cast<uint32_t>(copy.Size()));
+            if (Buffer() != nullptr && (m_Flags & File::USER_WRITE) != 0) {
+                // Preserve private modifications as well as the backing-file contents.
+                ::memcpy(Buffer(), copy.Buffer(), static_cast<size_t>(copy.Size()));
+            }
+        }
     }
 
     DataElementFile::DataElementFile(DataElementFile&& move)
@@ -91,7 +98,8 @@ namespace Core {
         , m_Flags(move.m_Flags)
     {
         move.m_Flags = 0;
-        m_MemoryMappedFile = INVALID_HANDLE_VALUE;
+        move.m_MemoryMappedFile = INVALID_HANDLE_VALUE;
+        move.Clear();
     }
 
     bool DataElementFile::Load() {
@@ -143,6 +151,8 @@ namespace Core {
 
             m_MemoryMappedFile = INVALID_HANDLE_VALUE;
         }
+        Clear();
+        m_File.Close();
     }
 
     /* virtual */ void DataElementFile::Reallocation(const uint64_t size)
@@ -241,6 +251,8 @@ namespace Core {
 
             m_File.Close();
         }
+        Clear();
+        m_File.Close();
     }
 
     /* virtual */ void DataElementFile::Reallocation(const uint64_t size)

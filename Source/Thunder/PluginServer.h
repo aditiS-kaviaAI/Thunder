@@ -127,6 +127,8 @@ namespace Plugin {
 namespace PluginHost {
 
     class Server {
+        // Naming the private Service requires friendship at this enclosing level.
+        friend struct P1HostAccess;
     public:
         static const TCHAR* ConfigFile;
         static const TCHAR* PluginOverrideDirectory;
@@ -392,6 +394,8 @@ namespace PluginHost {
         };
 
         class Service : public IShell::ICOMLink, public IShell::IConnectionServer, public PluginHost::Service {
+            // Defined only by the production-path P1 integration fixture.
+            friend struct P1HostAccess;
         public:
             enum mode {
                 CONFIGURED,
@@ -1750,7 +1754,10 @@ namespace PluginHost {
             ControlData _metadata;
             Core::Library _library;
 #ifdef HIBERNATE_SUPPORT_ENABLED
-            void* _hibernateStorage;
+            uint32_t HibernateProcessForPID(const uint32_t timeout, const pid_t pid);
+            uint32_t WakeupProcessForPID(const uint32_t timeout, const pid_t pid);
+            Core::CriticalSection _hibernateLock;
+            std::map<pid_t, void*> _hibernateStorage;
 #endif
             ExternalAccess _external;
             ServiceMap& _administrator;

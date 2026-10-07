@@ -19,6 +19,8 @@
 
 #include "PluginServer.h"
 #include "Controller.h"
+#include "SecurityPath.h"
+#include "ProcessStorage.h"
 
 #ifndef __WINDOWS__
 #include <syslog.h>
@@ -113,7 +115,7 @@ namespace PluginHost {
         // Allow a request to be checked before it is offered for processing.
         virtual bool Allowed(const string& path) const override
         {
-            return ((_hasSecurity == false) || (path.substr(0, _controllerPath.length()) == _controllerPath));
+            return ((_hasSecurity == false) || ControllerPath(path));
         }
 
         // Allow a request to be checked before it is offered for processing.
@@ -124,7 +126,7 @@ namespace PluginHost {
             if (result == false) {
                 // If there is security, maybe this is a valid reuest, althoug this
                 // validation is not done by an instance issued by the SecurityOfficer.
-                result = ((request.Verb == Web::Request::HTTP_GET) && (request.Path.substr(0, _controllerPath.length()) == _controllerPath));
+                result = ((request.Verb == Web::Request::HTTP_GET) && ControllerPath(request.Path));
 
                 if ((result == false) && (request.Verb == Web::Request::HTTP_POST) && (request.HasBody() == true) && (request.Path == _jsonrpcPath)) {
 
@@ -156,6 +158,11 @@ namespace PluginHost {
         END_INTERFACE_MAP
 
     private:
+        bool ControllerPath(const string& path) const
+        {
+            return Detail::IsControllerPath(path, _controllerPath);
+        }
+
         bool CheckMessage(const Core::JSONRPC::Message& message) const
         {
             bool result = false;
@@ -798,7 +805,7 @@ namespace PluginHost {
                     Unlock();
 
                     TRACE(Activity, (_T("Hibernation of plugin [%s] process [%u]"), Callsign().c_str(), parentPID));
-                    result = HibernateProcess(timeout, parentPID, _administrator.Configuration().HibernateLocator().c_str(), _T(""), &_hibernateStorage);
+                    result = HibernateProcessForPID(timeout, parentPID);
                     Lock();
                     if (State() != IShell::HIBERNATED) {
                         SYSLOG(Logging::Startup, (_T("Hibernation aborted of plugin [%s] process [%u]"), Callsign().c_str(), parentPID));
@@ -813,7 +820,7 @@ namespace PluginHost {
                     if (result != Core::ERROR_NONE && result != Core::ERROR_ABORTED) {
                         // try to wakeup Parent process to revert Hibernation and recover
                         TRACE(Activity, (_T("Wakeup plugin [%s] process [%u] on Hibernate error [%d]"), Callsign().c_str(), parentPID, result));
-                        WakeupProcess(timeout, parentPID, _administrator.Configuration().HibernateLocator().c_str(), _T(""), &_hibernateStorage);
+                        WakeupProcessForPID(timeout, parentPID);
                     }
 
                     Lock();
@@ -871,7 +878,7 @@ namespace PluginHost {
                 WakeupChildren(parentPID, timeout);
 
                 TRACE(Activity, (_T("Wakeup of plugin [%s] process [%u]"), Callsign().c_str(), parentPID));
-                result = WakeupProcess(timeout, parentPID, _administrator.Configuration().HibernateLocator().c_str(), _T(""), &_hibernateStorage);
+                result = WakeupProcessForPID(timeout, parentPID);
 #else
                 result = Core::ERROR_NONE;
 #endif
@@ -887,6 +894,30 @@ namespace PluginHost {
     }
 
 #ifdef HIBERNATE_SUPPORT_ENABLED
+    uint32_t Server::Service::HibernateProcessForPID(const uint32_t timeout, const pid_t pid)
+    {
+        _hibernateLock.Lock();
+        const uint32_t result = Detail::WithProcessStorage(_hibernateStorage, pid,
+            [&](void** slot) {
+                return HibernateProcess(timeout, pid,
+                    _administrator.Configuration().HibernateLocator().c_str(), _T(""), slot);
+            }, false);
+        _hibernateLock.Unlock();
+        return result;
+    }
+
+    uint32_t Server::Service::WakeupProcessForPID(const uint32_t timeout, const pid_t pid)
+    {
+        _hibernateLock.Lock();
+        const uint32_t result = Detail::WithProcessStorage(_hibernateStorage, pid,
+            [&](void** slot) {
+                return WakeupProcess(timeout, pid,
+                    _administrator.Configuration().HibernateLocator().c_str(), _T(""), slot);
+            }, true);
+        _hibernateLock.Unlock();
+        return result;
+    }
+
     uint32_t Server::Service::HibernateChildren(const pid_t parentPID, const uint32_t timeout)
     {
         Core::hresult result = Core::ERROR_NONE;
@@ -909,7 +940,7 @@ namespace PluginHost {
                     break;
                 }
                 Unlock();
-                result = HibernateProcess(timeout, *iter, _administrator.Configuration().HibernateLocator().c_str(), _T(""), &_hibernateStorage);
+                result = HibernateProcessForPID(timeout, *iter);
                 if (result == HIBERNATE_ERROR_NONE) {
                     // Hibernate Children of this process
                     result = HibernateChildren(*iter, timeout);
@@ -921,13 +952,13 @@ namespace PluginHost {
                 if (result != HIBERNATE_ERROR_NONE) {
                     // try to recover by reverting current Hibernations
                     TRACE(Activity, (_T("Wakeup plugin [%s] process [%u] on Hibernate error [%d]"), Callsign().c_str(), *iter, result));
-                    WakeupProcess(timeout, *iter, _administrator.Configuration().HibernateLocator().c_str(), _T(""), &_hibernateStorage);
+                    WakeupProcessForPID(timeout, *iter);
                     // revert previous Hibernations and break
                     while (iter != childrenPIDs.begin()) {
                         --iter;
                         WakeupChildren(*iter, timeout);
                         TRACE(Activity, (_T("Wakeup plugin [%s] process [%u] on Hibernate error [%d]"), Callsign().c_str(), *iter, result));
-                        WakeupProcess(timeout, *iter, _administrator.Configuration().HibernateLocator().c_str(), _T(""), &_hibernateStorage);
+                        WakeupProcessForPID(timeout, *iter);
                     }
                     break;
                 }
@@ -951,7 +982,7 @@ namespace PluginHost {
                 // There is no recovery path while doing Wakeup, don't care about errors
                 WakeupChildren(children.Current().Id(), timeout);
                 TRACE(Activity, (_T("Wakeup of plugin [%s] child process [%u]"), Callsign().c_str(), children.Current().Id()));
-                result = WakeupProcess(timeout, children.Current().Id(), _administrator.Configuration().HibernateLocator().c_str(), _T(""), &_hibernateStorage);
+                result = WakeupProcessForPID(timeout, children.Current().Id());
             }
         }
 

@@ -173,6 +173,7 @@ namespace Crypto {
                 ASSERT((callback == nullptr) ^ (_callback == nullptr));
 
                 _callback = callback;
+                ConfigureVerification();
                 Core::SocketPort::Unlock();
             }
             uint32_t Certificate(const Crypto::Certificate& certificate, const Crypto::Key& key);
@@ -182,12 +183,14 @@ namespace Crypto {
             void Update();
             void ValidateHandShake();
             void CreateContext(const struct ssl_method_st* method);
+            void ConfigureVerification();
  
         private:
             SecureSocketPort& _parent;
             struct ssl_ctx_st* _context;
             struct ssl_st* _ssl;
             const IValidate* _callback;
+            const bool _server;
             mutable state _handShaking;
         };
 
