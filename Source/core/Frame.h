@@ -266,14 +266,19 @@ namespace Core {
 
                 return (result);
             }
+            // PUBLIC_INTERFACE
+            /** Decode a TYPENAME at the current offset, advance by its encoded length and return its value. */
             template <typename TYPENAME>
             TYPENAME VariableNumber() const
             {
-                TYPENAME result;
+                // Keep the returned value initialized and return the decoder's output rather than falling through.
+                TYPENAME result = 0;
 
                 ASSERT(_container != nullptr);
 
                 _offset += _container->GetVariableNumber<TYPENAME>(_offset, result);
+
+                return (result);
             }
             bool Boolean() const
             {
@@ -638,6 +643,8 @@ namespace Core {
 
             return (1);
         }
+        // PUBLIC_INTERFACE
+        /** Encode number at offset in the selected byte order; grow the frame as needed and return bytes written. */
         template <typename TYPENAME>
         inline SIZE_CONTEXT SetVariableNumber(const SIZE_CONTEXT offset, const TYPENAME number)
         {
@@ -648,15 +655,15 @@ namespace Core {
             static_assert(Frame::RealSize<TYPENAME>() <= ((sizeof(bytes) * 7) / 8));
 
             do {
-                bytes[index++] = ( static_cast<uint8_t>(value % 128) | 0x80 );
+                // Store payload groups only; continuation flags depend on the final wire order.
+                bytes[index++] = static_cast<uint8_t>(value % 128);
                 value /= 128;
 
             } while (value > 0);
 
-            bytes[index - 1] ^= 0x80;
-
-            if ((offset + index) >= _size) {
-                Size(offset + Frame::RealSize<TYPENAME>());
+            // A variable number can require more bytes than its native integer width.
+            if ((offset + index) > _size) {
+                Size(offset + index);
             }
 
             if ( (BIG_ENDIAN_ORDERING == true) && (index > 1) ) {
@@ -664,6 +671,11 @@ namespace Core {
                 for (uint8_t step = 0; step < (index / 2); step++) {
                     std::swap(bytes[step], bytes[index - 1 - step]);
                 }
+            }
+
+            // Every wire byte except the last must indicate that another group follows.
+            for (uint8_t step = 0; step + 1 < index; step++) {
+                bytes[step] |= 0x80;
             }
 
             ::memcpy(&(_data[offset]), bytes, index);

@@ -43,10 +43,11 @@ namespace Core
         uint16_t srcLength = sourceLength;
         uint16_t dstLength = destinationLength;
 
-        while ((*source != '\0') && (srcLength != 0) && (dstLength >= 3)) {
+        // Length-delimited inputs need not have a terminator, and zero-length inputs may be null.
+        while ((srcLength != 0) && (dstLength >= 3) && (*source != '\0')) {
             TCHAR current = *source++;
 
-            if ((isalnum(current) != 0) || (current == '-') || (current == '_') || (current == '.') || (current == '~')) {
+            if ((isalnum(static_cast<unsigned char>(current)) != 0) || (current == '-') || (current == '_') || (current == '.') || (current == '~')) {
                 *destination++ = current;
                 dstLength--;
             } else if (current == ' ') {
@@ -75,23 +76,24 @@ namespace Core
         uint16_t srcLength = sourceLength;
         uint16_t dstLength = destinationLength;
 
-        while ((*source != '\0') && (srcLength != 0) && (dstLength != 0)) {
+        // Check the supplied extent before every read, including percent-escape lookahead.
+        while ((srcLength != 0) && (dstLength != 0) && (*source != '\0')) {
             TCHAR current = *source++;
-
-            if (current == '%') {
-                if ((source[0] != '\0') && (source[1] != '\0')) {
-                    *destination++ = (((isdigit(source[0]) ? (source[0] - '0') : (tolower(source[0]) - 'a' + 10)) & 0x0F) << 4) | ((isdigit(source[1]) ? (source[1] - '0') : (tolower(source[1]) - 'a' + 10)) & 0x0F);
-                    source += 2;
-                    srcLength -= 3;
-                }
+            --srcLength;
+            if ((current == '%') && (srcLength >= 2)
+                && isxdigit(static_cast<unsigned char>(source[0]))
+                && isxdigit(static_cast<unsigned char>(source[1]))) {
+                const unsigned char high = static_cast<unsigned char>(source[0]);
+                const unsigned char low = static_cast<unsigned char>(source[1]);
+                current = static_cast<TCHAR>(((isdigit(high) ? high - '0' : tolower(high) - 'a' + 10) << 4)
+                    | (isdigit(low) ? low - '0' : tolower(low) - 'a' + 10));
+                source += 2;
+                srcLength -= 2;
             } else if (current == '+') {
-                *destination++ = ' ';
-                srcLength--;
-            } else {
-                *destination++ = current;
-                srcLength--;
+                current = ' ';
             }
-
+            // Incomplete or nonhex escapes are preserved literally, with accurate output accounting.
+            *destination++ = current;
             dstLength--;
         }
 
@@ -222,13 +224,17 @@ namespace Core
     //     |           |               |       |                 |                   |       |
     //  scheme      userinfo        hostname  port              path               query    hash
     //
-    void URL::Parse(const TextFragment& urlStr)
+    void URL::Parse(const TextFragment& input)
     {
+        // TextFragment's borrowed-buffer searches assume termination; own only the declared input bytes.
+        const TextFragment urlStr(input.Length() == 0 ? string() : input.Text());
         uint32_t offset = 0;
         uint32_t length = urlStr.Length();
 
         // find he first part, the scheme
-        if (((offset = urlStr.ForwardFind(':', 0)) >= length) || (urlStr[offset+1] != '/') || (urlStr[offset+2] != '/')) {
+        // The fragment may end at ':' or ':/' and must not be indexed beyond its extent.
+        if (((offset = urlStr.ForwardFind(':', 0)) >= length) || (length - offset < 3)
+            || (urlStr[offset+1] != '/') || (urlStr[offset+2] != '/')) {
             _scheme = SCHEME_UNKNOWN;
         }
         else {

@@ -34,3 +34,19 @@ enable_testing()
 
 add_subdirectory(core)
 add_subdirectory(tests)
+
+# Compile current affected implementations so focused issue verification cannot use stale library code.
+add_executable(WPEFramework_test_issue_boundaries
+    core/test_asn1.cpp
+    core/test_issue_boundaries.cpp
+    ../../Source/websocket/URL.cpp
+    ../../Source/cryptalgo/AES.cpp
+    ../../Source/cryptalgo/AESImplementation.cpp
+)
+target_link_libraries(WPEFramework_test_issue_boundaries
+    ${GTEST_LIBRARY}
+    ${GTEST_MAIN_LIBRARY}
+    ${CMAKE_THREAD_LIBS_INIT}
+    WPEFrameworkCore
+)
+add_test(NAME WPEFramework_test_issue_boundaries COMMAND WPEFramework_test_issue_boundaries)

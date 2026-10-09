@@ -21,6 +21,8 @@ set(TEST_RUNNER_NAME "WPEFramework_test_core")
 
 add_executable(${TEST_RUNNER_NAME}
    ../IPTestAdministrator.cpp
+   # Exercise ASN.1 parsers without requiring the fork-based harness.
+   test_asn1.cpp
    test_cyclicbuffer.cpp
    #test_databuffer.cpp
    test_dataelement.cpp

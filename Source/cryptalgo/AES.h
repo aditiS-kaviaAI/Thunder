@@ -66,6 +66,9 @@ namespace Crypto {
         }
         uint32_t Key(const uint8_t length, const uint8_t key[]);
 
+        // PUBLIC_INTERFACE
+        /** Encrypt length input bytes into output using the configured key/IV; return zero on success.
+         * ECB/CBC require multiples of 16 (no padding); ERROR_BAD_REQUEST preserves output and IV otherwise. */
         uint32_t Encrypt(const uint32_t length, const uint8_t input[], uint8_t output[]);
 
     private:
@@ -103,6 +106,9 @@ namespace Crypto {
         }
         uint32_t Key(const uint8_t length, const uint8_t key[]);
 
+        // PUBLIC_INTERFACE
+        /** Decrypt length input bytes into output using the configured key/IV; return zero on success.
+         * ECB/CBC require multiples of 16 (no padding); ERROR_BAD_REQUEST preserves output and IV otherwise. */
         uint32_t Decrypt(const uint32_t length, const uint8_t input[], uint8_t output[]);
 
     private:

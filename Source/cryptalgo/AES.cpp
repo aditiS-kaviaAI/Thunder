@@ -41,7 +41,10 @@ namespace Crypto {
 
     uint32_t AESEncryption::Encrypt(const uint32_t length, const uint8_t input[], uint8_t output[])
     {
-
+        // ECB/CBC cannot round-trip truncated ciphertext; reject before any block changes output or IV.
+        if (((Type() == AES_ECB) || (Type() == AES_CBC)) && ((length % 16) != 0)) {
+            return (Core::ERROR_BAD_REQUEST);
+        }
         uint32_t result = Core::ERROR_UNAVAILABLE;
 
         switch (Type()) {
@@ -206,6 +209,10 @@ namespace Crypto {
 
     uint32_t AESDecryption::Decrypt(const uint32_t length, const uint8_t input[], uint8_t output[])
     {
+        // Match encryption's whole-block contract and leave output/IV untouched on invalid input.
+        if (((Type() == AES_ECB) || (Type() == AES_CBC)) && ((length % 16) != 0)) {
+            return (Core::ERROR_BAD_REQUEST);
+        }
         uint32_t result = Core::ERROR_UNAVAILABLE;
 
         switch (Type()) {

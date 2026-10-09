@@ -383,7 +383,13 @@ namespace Core {
             }
             return (result);
         }
+        // PUBLIC_INTERFACE
+        /** Encode at most sourceLength characters into destinationLength slots; return characters written.
+         * Null pointers are permitted only for zero extents; terminate output when capacity remains. */
         static uint16_t Encode(const TCHAR* source, const uint16_t sourceLength, TCHAR* destination, const uint16_t destinationLength);
+        // PUBLIC_INTERFACE
+        /** Decode bounded input into bounded output and return characters written.
+         * Preserve malformed escapes literally; null pointers require zero extents. Terminate when space remains. */
         static uint16_t Decode(const TCHAR* source, const uint16_t sourceLength, TCHAR* destination, const uint16_t destinationLength);
         static uint16_t Base64Encode(const uint8_t* source, const uint16_t sourceLength, TCHAR* destination, const uint16_t destinationLength, const bool padding = false);
         static uint16_t Base64Decode(const TCHAR* source, const uint16_t sourceLength, uint8_t* destination, const uint16_t destinationLength, const TCHAR* ignoreList = nullptr);

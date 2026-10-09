@@ -25,6 +25,11 @@
 // ---- Include local include files ----
 #include "Module.h"
 #include "Portability.h"
+// ASN.1 must compile when included directly, not only after the core umbrella header.
+#include "Trace.h"
+#include <memory>
+#include <vector>
+#include <cstdlib>
 
 // ---- Referenced classes and types ----
 
@@ -35,187 +40,200 @@ namespace WPEFramework {
 namespace Core {
     namespace ASN1 {
 
-        // ===================================================================
-        // NOT THREAD SAFE !!!!! on RELEASE!!!!!
-        // ===================================================================
+        // Copies share bytes and logical size; concurrent mutation still requires caller synchronization.
+        // PUBLIC_INTERFACE
+        /** Shared ASN.1 byte storage with uint16_t capacity and checked logical size. */
         class Buffer {
         private:
-            static constexpr uint8_t AdminSize = 5;
+            /** Own the allocation and shared size without an in-band, wrapping reference counter. */
+            struct Storage {
+                explicit Storage(const uint16_t length)
+                    : bytes(length), size(length) {}
+                std::vector<uint8_t> bytes;
+                uint16_t size;
+            };
 
         public:
-            Buffer()
-                : _buffer(nullptr)
-            {
-            }
+            // PUBLIC_INTERFACE
+            /** Create empty shared storage. */
+            Buffer() = default;
+            // PUBLIC_INTERFACE
+            /** Allocate length bytes using the standard allocator's failure policy. */
             Buffer(const uint16_t length)
-                : _buffer(length == 0 ? nullptr : new uint8_t[length + AdminSize])
-            {
-                if (_buffer != nullptr) {
-                    _buffer[0] = 1;
-                    _buffer[1] = (length & 0xFF);
-                    _buffer[2] = ((length >> 8) && 0xFF);
-                    _buffer[3] = (length & 0xFF);
-                    _buffer[4] = ((length >> 8) && 0xFF);
-                }
-            }
-            Buffer(const Buffer& copy)
-                : _buffer(copy._buffer)
-            {
-                AddRef();
-            }
-            ~Buffer()
-            {
-                Release();
-            }
-
-            Buffer& operator=(const Buffer& RHS)
-            {
-                if (&RHS != this) {
-                    Release();
-                    _buffer = RHS._buffer;
-                    AddRef();
-                }
-                return (*this);
-            }
+                : _buffer(length == 0 ? nullptr : std::make_shared<Storage>(length)) {}
+            // PUBLIC_INTERFACE
+            /** Share the source's allocation and logical size. */
+            Buffer(const Buffer& copy) = default;
+            // PUBLIC_INTERFACE
+            /** Release this owner's reference; the last owner frees the allocation. */
+            ~Buffer() = default;
+            // PUBLIC_INTERFACE
+            /** Share RHS storage and return this buffer; self-assignment is safe. */
+            Buffer& operator=(const Buffer& RHS) = default;
 
         public:
+            // PUBLIC_INTERFACE
+            /** Set shared logical length; requests beyond allocated capacity leave it unchanged. */
             inline void Size(const uint16_t length)
             {
-                ASSERT((_buffer != nullptr) && (length < ((_buffer[3] << 8) | _buffer[4])));
-
+                // Reject without mutation; the framework normally disables exception handling.
+                if (length > (_buffer ? _buffer->bytes.size() : 0)) {
+                    return;
+                }
                 if (_buffer != nullptr) {
-                    _buffer[1] = (length & 0xFF);
-                    _buffer[2] = ((length >> 8) && 0xFF);
+                    _buffer->size = length;
                 }
             }
+            // PUBLIC_INTERFACE
+            /** Return the shared logical byte count, or zero for empty storage. */
             inline uint16_t Size() const
             {
-                return (_buffer != nullptr ? (_buffer[2] << 8) | _buffer[1] : 0);
+                return (_buffer != nullptr ? _buffer->size : 0);
             }
+            // PUBLIC_INTERFACE
+            /** Return a mutable byte at index; invalid indexing terminates the process. */
             inline uint8_t& operator[](const uint32_t index)
             {
-                ASSERT((_buffer != nullptr) && (index < Size()));
-                return (_buffer[index + AdminSize]);
+                // A reference cannot report failure; enforce bounds even when assertions are disabled.
+                if (index >= Size()) {
+                    std::abort();
+                }
+                return (_buffer->bytes[index]);
             }
+            // PUBLIC_INTERFACE
+            /** Return a const byte at index; invalid indexing terminates the process. */
             inline const uint8_t& operator[](const uint32_t index) const
             {
-                ASSERT((_buffer != nullptr) && (index < Size()));
-
-                return (_buffer[index + AdminSize]);
+                // Match mutable indexing without requiring exceptions or returning a dummy reference.
+                if (index >= Size()) {
+                    std::abort();
+                }
+                return (_buffer->bytes[index]);
             }
 
         private:
-            void AddRef()
-            {
-                if (_buffer != nullptr) {
-                    _buffer[0] = _buffer[0] + 1;
-                }
-            }
-            void Release()
-            {
-                if (_buffer != nullptr) {
-                    if (_buffer[0] == 1) {
-                        delete _buffer;
-                    } else {
-                        _buffer[0] = _buffer[0] - 1;
-                    }
-                }
-            }
-
-        private:
-            uint8_t* _buffer;
+            std::shared_ptr<Storage> _buffer;
         };
 
         class OID {
         public:
+            // PUBLIC_INTERFACE
+            /** Bounded iterator over uint16_t OID arcs; malformed or oversized arcs end iteration. */
             class Iterator {
             public:
+                // PUBLIC_INTERFACE
+                /** Create an empty iterator. */
                 Iterator()
-                    : _length(0)
-                    , _index(0xFFFF)
-                    , _buffer(0)
-                {
-                }
+                    : Iterator(nullptr, 0) {}
+                // PUBLIC_INTERFACE
+                /** Borrow length encoded bytes; caller retains their lifetime. */
                 Iterator(const uint8_t* buffer, const uint16_t length)
                     : _length(length)
-                    , _index(0xFFFF)
+                    , _index(0)
                     , _buffer(buffer)
-                {
-                }
-                Iterator(const Iterator& copy)
-                    : _length(copy._length)
-                    , _index(copy._index)
-                    , _buffer(copy._buffer)
-                {
-                }
-                ~Iterator()
-                {
-                }
-
-                Iterator& operator=(const Iterator& RHS)
-                {
-                    _length = RHS._length;
-                    _index = RHS._index;
-                    _buffer = RHS._buffer;
-                    return (*this);
-                }
+                    , _number(0)
+                    , _second(0)
+                    , _state(0)
+                    , _valid(false) {}
+                // PUBLIC_INTERFACE
+                /** Copy iterator position without taking ownership of bytes. */
+                Iterator(const Iterator& copy) = default;
+                // PUBLIC_INTERFACE
+                /** Destroy the iterator without releasing borrowed bytes. */
+                ~Iterator() = default;
+                // PUBLIC_INTERFACE
+                /** Copy RHS position and return this iterator. */
+                Iterator& operator=(const Iterator& RHS) = default;
 
             public:
+                // PUBLIC_INTERFACE
+                /** Return whether the last Next call produced an arc. */
                 inline bool IsValid() const
                 {
-                    return ((_index == 0xFFFE) && (_index < _length));
+                    return (_valid);
                 }
+                // PUBLIC_INTERFACE
+                /** Rewind to before the first arc. */
                 inline void Reset()
                 {
-                    _index = 0xFFFF;
+                    _index = 0;
+                    _state = 0;
+                    _valid = false;
                 }
+                // PUBLIC_INTERFACE
+                /** Advance one complete arc; return false at end or on malformed input. */
                 inline bool Next()
                 {
-                    if (_index == 0xFFFF) {
-                        _index = 0xFFFE;
-                    } else if (_index == 0xFFFE) {
-                        _index = 0;
-                    } else
-                        while ((_index < _length) && ((_buffer[_index] & 0x80) != 0)) {
-                            _index++;
+                    _valid = false;
+                    if (_state == 3) {
+                        return (false);
+                    }
+                    if (_state == 1) {
+                        _number = _second;
+                        _state = 2;
+                        _valid = true;
+                    } else {
+                        uint32_t value = 0;
+                        // The packed first subidentifier may be 80 greater than a uint16_t arc.
+                        const uint32_t limit = (_state == 0 ? 65535u + 80u : 65535u);
+                        if (Decode(value, limit)) {
+                            if (_state == 0) {
+                                _number = (value < 40 ? 0 : (value < 80 ? 1 : 2));
+                                _second = static_cast<uint16_t>(value - _number * 40);
+                                _state = 1;
+                            } else {
+                                _number = static_cast<uint16_t>(value);
+                            }
+                            _valid = true;
+                        } else {
+                            _state = 3;
                         }
-
-                    return (IsValid());
+                    }
+                    return (_valid);
                 }
+                // PUBLIC_INTERFACE
+                /** Return the current uint16_t arc, or zero when invalid. */
                 inline uint16_t Number() const
                 {
-                    ASSERT(IsValid());
-
-                    if (_index == 0xFFFE) {
-                        return (_buffer[0] / 40);
-                    } else if (_index == 0) {
-                        return (_buffer[0] % 40);
-                    } else if (_buffer[_index] <= 127) {
-                        return (_buffer[_index]);
-                    }
-
-                    return (((_buffer[_index] & 0x7F) << 7) | (_buffer[_index + 1] & 0x7F));
+                    return (_valid ? _number : 0);
                 }
+                // PUBLIC_INTERFACE
+                /** Count complete arcs from the beginning without changing this position. */
                 inline uint16_t Count() const
                 {
                     uint16_t result = 0;
-                    uint16_t index = 1;
-
-                    while (index < _length) {
-                        if (_buffer[index] > 127) {
-                            index++;
-                        }
-                        index++;
-                        result++;
+                    Iterator cursor(_buffer, _length);
+                    while (cursor.Next()) {
+                        ++result;
                     }
-
-                    return (2 + result);
+                    return (result);
                 }
 
             private:
+                /** Consume a bounded base-128 subidentifier; false means missing terminator or overflow. */
+                bool Decode(uint32_t& value, const uint32_t limit)
+                {
+                    while ((_buffer != nullptr) && (_index < _length)) {
+                        const uint8_t byte = _buffer[_index++];
+                        const uint32_t payload = byte & 0x7F;
+                        if (value > (limit - payload) / 128) {
+                            return (false);
+                        }
+                        value = value * 128 + payload;
+                        if ((byte & 0x80) == 0) {
+                            return (true);
+                        }
+                    }
+                    return (false);
+                }
+
                 uint16_t _length;
                 uint16_t _index;
                 const uint8_t* _buffer;
+                uint16_t _number;
+                uint16_t _second;
+                uint8_t _state;
+                bool _valid;
             };
 
         public:
@@ -224,58 +242,54 @@ namespace Core {
             {
                 ::memcpy(_buffer, identifier, _length);
             }
-            OID(const string& OID)
+            // PUBLIC_INTERFACE
+            /** Encode dotted decimal or 0x-prefixed uint16_t arcs; invalid input yields an empty OID. */
+            OID(const string& identifier)
                 : _length(0)
             {
-                _buffer[0] = 0;
-                uint16_t firstSet = ~0;
-                uint16_t index = 0;
-                uint32_t value = 0;
-                uint16_t digits = 0;
-                uint8_t base = 10;
-
-                // Decode the string
-                while (index < OID.length()) {
-                    if (OID[index] == '.') {
-                        if (firstSet == static_cast<uint16_t>(~0)) {
-                            if (firstSet >= 7) {
-                                break;
-                            }
-                            firstSet = value;
-                        } else if (_length == 0) {
-                            if (value >= 40) {
-                                break;
-                            }
-
-                            _buffer[0] = (firstSet * 40) + value;
-                            _length++;
-                        } else if (_length >= (sizeof(_buffer) - (value <= 127 ? 1 : 2))) {
-                            break;
-                        } else if (value <= 127) {
-                            _buffer[_length] = value;
-                            _length++;
-                        } else {
-                            _buffer[_length] = 0x80 | ((value >> 7) & 0xFF);
-                            _length++;
-                            _buffer[_length] = (value & 0x7F);
-                            _length++;
-                        }
-                        // Store it we have a digit
-                        value = 0;
-                        digits = 0;
-                        base = 10;
-                    } else if (toupper(OID[index]) == 'X') {
-                        if ((value == 0) && (digits == 1)) {
-                            base = 16;
-                        }
-                    } else if (isdigit(OID[index])) {
-                        value = (value * base) + (OID[index] - '0');
-                    } else if ((base > 10) && (toupper(OID[index]) >= 'A') && (toupper(OID[index]) <= 'F')) {
-                        value = (value * base) + (toupper(OID[index]) - 'A' + 10);
+                size_t position = 0;
+                uint32_t first = 0;
+                uint32_t arcs = 0;
+                // Parse the final component too, and never publish a partially encoded invalid OID.
+                while (position < identifier.length()) {
+                    uint32_t value = 0;
+                    uint32_t base = 10;
+                    if ((identifier[position] == '0') && (position + 1 < identifier.length())
+                        && ((identifier[position + 1] == 'x') || (identifier[position + 1] == 'X'))) {
+                        base = 16;
+                        position += 2;
                     }
-
-                    digits++;
-                    index++;
+                    const size_t begin = position;
+                    while ((position < identifier.length()) && (identifier[position] != '.')) {
+                        const TCHAR character = identifier[position++];
+                        const uint32_t digit = (character >= '0' && character <= '9') ? character - '0'
+                            : (character >= 'a' && character <= 'f') ? character - 'a' + 10
+                            : (character >= 'A' && character <= 'F') ? character - 'A' + 10 : base;
+                        if ((digit >= base) || (value > (65535u - digit) / base)) {
+                            _length = 0;
+                            return;
+                        }
+                        value = value * base + digit;
+                    }
+                    if ((position == begin) || ((arcs == 0) && (value > 2))
+                        || ((arcs == 1) && (first < 2) && (value >= 40))) {
+                        _length = 0;
+                        return;
+                    }
+                    if (arcs == 0) {
+                        first = value;
+                    } else if (!Append(arcs == 1 ? first * 40 + value : value)) {
+                        _length = 0;
+                        return;
+                    }
+                    ++arcs;
+                    if (position < identifier.length() && ++position == identifier.length()) {
+                        _length = 0;
+                        return;
+                    }
+                }
+                if (arcs < 2) {
+                    _length = 0;
                 }
             }
             OID(const OID& copy)
@@ -308,6 +322,8 @@ namespace Core {
             {
                 return (&(_buffer[0]));
             }
+            // PUBLIC_INTERFACE
+            /** Render complete decoded arcs as dotted text, including zero-valued arcs. */
             inline string Text() const
             {
                 string result;
@@ -317,10 +333,11 @@ namespace Core {
                     string textValue;
                     uint16_t value = index.Number();
 
-                    while (value > 0) {
+                    // Zero is a real arc, not an empty textual component.
+                    do {
                         textValue = static_cast<char>((value % 10) + '0') + textValue;
                         value /= 10;
-                    }
+                    } while (value > 0);
 
                     if (result.empty() == true) {
                         result = textValue;
@@ -340,6 +357,25 @@ namespace Core {
             }
 
         private:
+            /** Append one base-128 value, returning false without mutation if capacity is insufficient. */
+            bool Append(uint32_t value)
+            {
+                uint8_t bytes[3];
+                uint8_t count = 0;
+                do {
+                    bytes[count++] = value & 0x7F;
+                    value >>= 7;
+                } while (value != 0);
+                if (_length + count > sizeof(_buffer)) {
+                    return (false);
+                }
+                while (count != 0) {
+                    --count;
+                    _buffer[_length++] = bytes[count] | (count != 0 ? 0x80 : 0);
+                }
+                return (true);
+            }
+
             uint8_t _buffer[255];
             uint16_t _length;
         };
@@ -397,18 +433,25 @@ namespace Core {
             Sequence()
                 : _buffer(0)
                 , _index(0)
+                , _start(0)
                 , _length(0)
             {
             }
+            // PUBLIC_INTERFACE
+            /** Iterate short-form TLVs in a bounded slice; invalid slices are empty. */
             Sequence(const Buffer& buffer, const uint16_t index = 0, const uint16_t length = ~0)
                 : _buffer(buffer)
-                , _index(index)
-                , _length(length == static_cast<uint16_t>(~0) ? buffer.Size() : length)
+                , _index(0)
+                , _start(index)
+                , _length(index <= buffer.Size()
+                    && (length == static_cast<uint16_t>(~0) || length <= buffer.Size() - index)
+                    ? (length == static_cast<uint16_t>(~0) ? buffer.Size() : index + length) : index)
             {
             }
             Sequence(const Sequence& copy)
                 : _buffer(copy._buffer)
                 , _index(copy._index)
+                , _start(copy._start)
                 , _length(copy._length)
             {
             }
@@ -421,30 +464,46 @@ namespace Core {
 
                 _buffer = RHS._buffer;
                 _index = RHS._index;
+                _start = RHS._start;
                 _length = RHS._length;
 
                 return (*this);
             }
 
         public:
+            // PUBLIC_INTERFACE
+            /** Rewind to before the first TLV of the original slice. */
             inline void Reset()
             {
                 _index = 0;
             }
+            // PUBLIC_INTERFACE
+            /** Return true only for a complete short-form TLV in the slice and backing storage. */
             inline bool IsValid() const
             {
-                return ((_index > 0) && (_index < _length));
+                // Validate before reading length, including after another owner shrinks the buffer.
+                const uint32_t end = std::min<uint32_t>(_length, _buffer.Size());
+                return ((_index > _start) && (_index < end)
+                    && ((_buffer[_index] & 0x80) == 0)
+                    && (_buffer[_index] <= end - _index - 1));
             }
+            // PUBLIC_INTERFACE
+            /** Advance across header and payload; return false on exhaustion or malformed input. */
             inline bool Next()
             {
                 if (_index == 0) {
-                    _index++;
-                } else if (_index < _length) {
-                    // Time to jump over the section, if possible.
-                    _index += (Length() + 1);
+                    _index = _start + 1;
+                } else if (IsValid()) {
+                    // _index points at length, so the next length follows two header bytes.
+                    _index += (Length() + 2);
+                } else {
+                    return (false);
                 }
-
-                return (IsValid() == true);
+                if (!IsValid()) {
+                    _index = _length + 1;
+                    return (false);
+                }
+                return (true);
             }
             inline enumType Tag() const
             {
@@ -458,18 +517,23 @@ namespace Core {
 
                 return (static_cast<enumType>(_buffer[_index]));
             }
+            // PUBLIC_INTERFACE
+            /** Return borrowed payload bytes, or nullptr for empty/invalid values. */
             inline const uint8_t* Data() const
             {
-                ASSERT(IsValid() == true);
-
-                return (&(_buffer[_index + 1]));
+                return (IsValid() && Length() != 0 ? &(_buffer[_index + 1]) : nullptr);
             }
 
             //-----------------------------------------------------
             // BOOLEAN to BOOL VALUE (8Bits)
             //-----------------------------------------------------
+            // PUBLIC_INTERFACE
+            /** Extract a one-byte boolean; return an ASN.1 error without changing value on failure. */
             inline enumError Value(bool& value) const
             {
+                // Check extent, tag and scalar width before reading or mutating output.
+                const enumError error = Validate(TYPE_BOOLEAN, 1, 1);
+                if (error != ASN1_OK) { return (error); }
                 ASSERT(Tag() == TYPE_BOOLEAN);
                 ASSERT(Length() == 1);
 
@@ -480,14 +544,24 @@ namespace Core {
             //-----------------------------------------------------
             // INTEGER to SCALAR VALUE (8Bits)
             //-----------------------------------------------------
+            // PUBLIC_INTERFACE
+            /** Extract a one-byte integer; preserve value if extent, tag or width validation fails. */
             inline enumError Value(signed char& value) const
             {
+                // Reject empty and oversized integers before accessing payload bytes.
+                const enumError error = Validate(TYPE_INTEGER, 1, 1);
+                if (error != ASN1_OK) { return (error); }
                 ASSERT(Tag() == TYPE_INTEGER);
                 value = _buffer[_index + 1];
                 return (Length() <= 1 ? ASN1_OK : ASN1_BUF_TOO_SMALL);
             }
+            // PUBLIC_INTERFACE
+            /** Extract a one-byte unsigned integer; preserve value on validation failure. */
             inline enumError Value(unsigned char& value) const
             {
+                // Reject empty and oversized integers before accessing payload bytes.
+                const enumError error = Validate(TYPE_INTEGER, 1, 1);
+                if (error != ASN1_OK) { return (error); }
                 ASSERT(Tag() == TYPE_INTEGER);
                 value = _buffer[_index + 1];
                 return (Length() <= 1 ? ASN1_OK : ASN1_BUF_TOO_SMALL);
@@ -495,8 +569,13 @@ namespace Core {
             //-----------------------------------------------------
             // INTEGER to SCALAR VALUE (16Bits)
             //-----------------------------------------------------
+            // PUBLIC_INTERFACE
+            /** Extract an integer of at most two bytes; preserve value on validation failure. */
             inline enumError Value(int16_t& value) const
             {
+                // Validate the full scalar extent before reading it.
+                const enumError error = Validate(TYPE_INTEGER, 1, 2);
+                if (error != ASN1_OK) { return (error); }
                 ASSERT(Tag() == TYPE_INTEGER);
                 value = _buffer[_index + 1];
                 if (Length() > 1) {
@@ -504,8 +583,13 @@ namespace Core {
                 }
                 return (Length() <= 2 ? ASN1_OK : ASN1_BUF_TOO_SMALL);
             }
+            // PUBLIC_INTERFACE
+            /** Extract an unsigned integer of at most two bytes; preserve value on validation failure. */
             inline enumError Value(uint16_t& value) const
             {
+                // Validate the full scalar extent before reading it.
+                const enumError error = Validate(TYPE_INTEGER, 1, 2);
+                if (error != ASN1_OK) { return (error); }
                 ASSERT(Tag() == TYPE_INTEGER);
                 value = _buffer[_index + 1];
                 if (Length() > 1) {
@@ -516,8 +600,13 @@ namespace Core {
             //-----------------------------------------------------
             // INTEGER to SCALAR VALUE (32Bits)
             //-----------------------------------------------------
+            // PUBLIC_INTERFACE
+            /** Extract an unsigned integer of at most four bytes; preserve value on validation failure. */
             inline enumError Value(uint32_t& value) const
             {
+                // Validate the full scalar extent before reading it.
+                const enumError error = Validate(TYPE_INTEGER, 1, 4);
+                if (error != ASN1_OK) { return (error); }
                 ASSERT(Tag() == TYPE_INTEGER);
                 value = _buffer[_index + 1];
                 if (Length() > 1) {
@@ -531,8 +620,13 @@ namespace Core {
                 }
                 return (Length() <= 4 ? ASN1_OK : ASN1_BUF_TOO_SMALL);
             }
+            // PUBLIC_INTERFACE
+            /** Extract an integer of at most four bytes; preserve value on validation failure. */
             inline enumError Value(int32_t& value) const
             {
+                // Validate the full scalar extent before reading it.
+                const enumError error = Validate(TYPE_INTEGER, 1, 4);
+                if (error != ASN1_OK) { return (error); }
                 ASSERT(Tag() == TYPE_INTEGER);
                 value = _buffer[_index + 1];
                 if (Length() > 1) {
@@ -549,8 +643,13 @@ namespace Core {
             //-----------------------------------------------------
             // INTEGER to SCALAR VALUE (64Bits)
             //-----------------------------------------------------
+            // PUBLIC_INTERFACE
+            /** Extract an unsigned integer of at most eight bytes; preserve value on validation failure. */
             inline enumError Value(uint64_t& value) const
             {
+                // Validate the full scalar extent before reading it.
+                const enumError error = Validate(TYPE_INTEGER, 1, 8);
+                if (error != ASN1_OK) { return (error); }
                 ASSERT(Tag() == TYPE_INTEGER);
                 value = _buffer[_index + 1];
                 if (Length() > 1) {
@@ -576,8 +675,13 @@ namespace Core {
                 }
                 return (Length() <= 8 ? ASN1_OK : ASN1_BUF_TOO_SMALL);
             }
+            // PUBLIC_INTERFACE
+            /** Extract an integer of at most eight bytes; preserve value on validation failure. */
             inline enumError Value(int64_t& value) const
             {
+                // Validate the full scalar extent before reading it.
+                const enumError error = Validate(TYPE_INTEGER, 1, 8);
+                if (error != ASN1_OK) { return (error); }
                 ASSERT(Tag() == TYPE_INTEGER);
                 value = _buffer[_index + 1];
                 if (Length() > 1) {
@@ -601,13 +705,19 @@ namespace Core {
                 if (Length() > 7) {
                     value = (value << 8) | _buffer[_index + 8];
                 }
-                return (Length() <= 4 ? ASN1_OK : ASN1_BUF_TOO_SMALL);
+                // The signed 64-bit overload accepts eight bytes, just like the unsigned one.
+                return (ASN1_OK);
             }
             //-----------------------------------------------------
             // OID to OID class
             //-----------------------------------------------------
+            // PUBLIC_INTERFACE
+            /** Copy a nonempty OID payload; preserve value if TLV validation fails. */
             inline enumError Value(OID& value) const
             {
+                // An OID needs at least one encoded subidentifier.
+                const enumError error = Validate(TYPE_OID, 1, 127);
+                if (error != ASN1_OK) { return (error); }
                 ASSERT(Tag() == TYPE_OID);
                 value = OID(&_buffer[_index + 1], Length());
 
@@ -616,27 +726,49 @@ namespace Core {
             //-----------------------------------------------------
             // UTF8String to string class
             //-----------------------------------------------------
+            // PUBLIC_INTERFACE
+            /** Copy a UTF8String payload, including empty strings; preserve value on validation failure. */
             inline enumError Value(string& value) const
             {
+                // Empty terminal strings have no addressable payload byte.
+                const enumError error = Validate(TYPE_UTF8_STRING, 0, 127);
+                if (error != ASN1_OK) { return (error); }
                 ASSERT(Tag() == TYPE_UTF8_STRING);
-                value = string(reinterpret_cast<const char*>(&_buffer[_index + 1]), Length());
+                value = (Length() == 0 ? string() : string(reinterpret_cast<const char*>(Data()), Length()));
 
                 return (ASN1_OK);
             }
             //-----------------------------------------------------
             // SEQUENCE to ASN1Sequence class
             //-----------------------------------------------------
+            // PUBLIC_INTERFACE
+            /** Share a nested sequence's bounded payload slice; preserve value on validation failure. */
             inline enumError Value(Sequence& value) const
             {
-                ASSERT(Tag() == TYPE_SEQUENCE);
-                value = Sequence(_buffer, _index, Length());
+                // DER sequences use the constructed bit; retain support for the legacy enum tag.
+                if (!IsValid()) { return (ASN1_OUT_OF_DATA); }
+                if ((Tag() != TYPE_SEQUENCE) && (Tag() != (TYPE_SEQUENCE | TYPE_CONSTRUCTED))) {
+                    return (ASN1_UNEXPECTED_TAG);
+                }
+                value = Sequence(_buffer, static_cast<uint16_t>(_index + 1), Length());
 
                 return (ASN1_OK);
             }
 
         private:
+            /** Validate typed extraction without changing the caller's output. */
+            enumError Validate(const enumType tag, const uint8_t minimum, const uint8_t maximum) const
+            {
+                if (!IsValid()) { return (ASN1_OUT_OF_DATA); }
+                if (Tag() != tag) { return (ASN1_UNEXPECTED_TAG); }
+                if (Length() < minimum) { return (ASN1_INVALID_LENGTH); }
+                if (Length() > maximum) { return (ASN1_BUF_TOO_SMALL); }
+                return (ASN1_OK);
+            }
+
             Buffer _buffer;
             uint32_t _index;
+            uint32_t _start;
             uint32_t _length;
         };
     }
